@@ -12,6 +12,7 @@ import (
 	"net/smtp"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -19,6 +20,8 @@ import (
 )
 
 type EmailRequest struct {
+	APIKey    string
+	Username  string
 	Sender    string `json:"sender"`
 	Recipient string `json:"recipient"`
 	Subject   string `json:"subject"`
@@ -26,13 +29,55 @@ type EmailRequest struct {
 }
 
 type newUserReq struct {
-	Email string `json:"email"`
-	Token string `json:"token"`
-	IP    string "some IP"
+	Email    string `json:"email"`
+	Username string `json:"username"`
+	IP       string "some IP"
 }
 
 type DB struct {
 	Conn *sql.DB
+}
+
+type RateLimiter struct {
+	mu      sync.Mutex
+	clients map[string][]time.Time
+	limit   int
+	window  time.Duration
+}
+
+func (rl *RateLimiter) check(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	valid := rl.clients[key][:0]
+
+	for _, t := range rl.clients[key] {
+		if t.After(now.Add(-rl.window)) {
+			valid = append(valid, t)
+		}
+	}
+
+	if len(valid) >= rl.limit {
+		rl.clients[key] = valid
+		return false
+	}
+
+	rl.clients[key] = append(valid, now)
+	return true
+
+}
+
+func (rl *RateLimiter) cleanup() {
+	for range time.Tick(time.Minute) {
+		rl.mu.Lock()
+		for key, timestamps := range rl.clients {
+			if len(timestamps) == 0 || timestamps[len(timestamps)-1].Before(time.Now().Add(-rl.window)) {
+				delete(rl.clients, key)
+			}
+		}
+		rl.mu.Unlock()
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -57,7 +102,16 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func sendEmail(req EmailRequest) error {
+func sendEmail(req EmailRequest, rateLimiter *RateLimiter) error {
+
+	if rateLimiter.check(req.Username) == false {
+		return fmt.Errorf("429")
+	}
+
+	// if db.authenticateClient() == false {
+	// 	return fmt.Errorf("401")
+	// }
+
 	_ = godotenv.Load()
 
 	if _, err := mail.ParseAddress(req.Recipient); err != nil {
@@ -108,70 +162,54 @@ func getIP(r *http.Request) string {
 	return host
 }
 
-func (db *DB) createUser(req newUserReq) error {
+func (db *DB) createUser(req newUserReq, rateLimiter *RateLimiter) error {
+
+	if rateLimiter.check(req.IP) == false {
+		return fmt.Errorf("429")
+	}
 
 	if _, err := mail.ParseAddress(req.Email); err != nil {
 		return fmt.Errorf("An invalid email address was given.")
 	}
 
-	var exists bool
+	var usernameExists bool
+	var emailExists bool
 
 	err := db.Conn.QueryRow(`
         SELECT EXISTS(
             SELECT 1 FROM clients WHERE email = ?
         )
-    `, req.Email).Scan(&exists)
+    `, req.Email).Scan(&emailExists)
 
 	if err != nil {
-		// checks if token exists. noting so i dont forget
-
-		var expires int64
-
-		err = db.Conn.QueryRow(`
-			SELECT expires_at
-			FROM tokens
-			WHERE token = ? AND ip = ?
-		`, req.Token, req.IP).Scan(&expires)
-
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("Invalid token or IP mismatch.")
-		}
-		if err != nil {
-			return err
-		}
-		if time.Now().Unix() > expires {
-			return fmt.Errorf("Token expired.")
-		}
-
-		// do email verification later
-
-		var maxID int
-
-		err = db.Conn.QueryRow(`
-			SELECT MAX(id) FROM users
-		`).Scan(&maxID)
-
-		b := make([]byte, 16)
-		rand.Read(b)
-
-		_, err = db.Conn.Exec(`
-			INSERT INTO users (id, email, api_key)
-			VALUES (?, ?, ?)
-		`, maxID+1, req.Email, hex.EncodeToString(b)) // make api generate function better or something idk and hash it
-
-		_, err = db.Conn.Exec(`
-			DELETE FROM tokens
-			WHERE token = ? AND ip = ?
-		`, req.Token, req.IP)
+		return fmt.Errorf("An account with this email already exists!")
 	}
 
-	return fmt.Errorf("Email already exists.")
+	err = db.Conn.QueryRow(`
+        SELECT EXISTS(
+            SELECT 1 FROM clients WHERE username = ?
+        )
+    `, req.Username).Scan(&usernameExists)
+
+	if err != nil {
+		return fmt.Errorf("Username already exists!")
+	}
+
+	b := make([]byte, 16)
+	rand.Read(b)
+
+	_, err = db.Conn.Exec(`
+		INSERT INTO users (id, email, api_key)
+		VALUES (?, ?, ?)
+	`, req.Username, req.Email, hex.EncodeToString(b)) // make api generate function better or something idk and hash it
+
+	return fmt.Errorf("500" + err.Error())
 }
 
 func (db *DB) initDB() error {
 	_, err := db.Conn.Exec(`
         CREATE TABLE IF NOT EXISTS users (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username INTEGER PRIMARY KEY AUTOINCREMENT,
 			email TEXT NOT NULL UNIQUE,
 			api_key TEXT NOT NULL UNIQUE
 		);
@@ -194,6 +232,28 @@ func (db *DB) initDB() error {
 	return nil
 }
 
+func (db *DB) authenticateClient(apikey, username string) {
+	// do later
+}
+
+func initRl() (signupRl *RateLimiter, reqRl *RateLimiter) {
+	SRl := RateLimiter{
+		clients: make(map[string][]time.Time),
+		limit:   10,
+		window:  (time.Duration(30) * time.Second),
+	}
+	go SRl.cleanup()
+
+	RRl := RateLimiter{
+		clients: make(map[string][]time.Time),
+		limit:   5,
+		window:  (time.Duration(60) * time.Second),
+	}
+	go RRl.cleanup()
+
+	return &SRl, &RRl
+}
+
 func newSqlDb() (*DB, error) {
 	conn, err := sql.Open("sqlite3", "api-keys.db")
 	if err != nil {
@@ -211,6 +271,8 @@ func main() {
 		panic(err)
 	}
 	db.initDB()
+
+	signupRl, reqRl := initRl()
 
 	mux := http.NewServeMux()
 
@@ -245,12 +307,18 @@ func main() {
 			req.Subject = "Authentication by 3272010.xyz"
 		}
 
-		result := sendEmail(req)
+		result := sendEmail(req, &reqRl) // omg bro im going to die. what am i doing wrong with this pointer
 
 		if result == nil {
 			writeJSON(w, 200, "success")
 		} else {
-			writeError(w, 500, result.Error())
+			if result.Error() == "429" {
+				writeError(w, 429, "Too many requests. You are being rate limited.")
+			} else if result.Error() == "401" {
+				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key")
+			} else {
+				writeError(w, 500, result.Error())
+			}
 		}
 
 	})
@@ -278,12 +346,18 @@ func main() {
 
 		req.IP = getIP(r)
 
-		result := db.createUser(req)
+		result := db.createUser(req, &signupRl) // and this one
 
 		if result == nil {
 			writeJSON(w, 200, "success")
 		} else {
-			writeError(w, 400, result.Error())
+			if result.Error() == "429" {
+				writeError(w, 429, "Too many requests. You are being rate limited.")
+			} else if result.Error()[:3] == "500" {
+				writeError(w, 500, result.Error()[3:])
+			} else {
+				writeError(w, 400, result.Error())
+			}
 		}
 
 	})
@@ -291,3 +365,5 @@ func main() {
 	fmt.Println("Server running on http://localhost:8080")
 	http.ListenAndServe(":8080", mux)
 }
+
+// im not even going to compile. i havent compiled a single time today and im done bruh. this is the poorest developed api ever probably.

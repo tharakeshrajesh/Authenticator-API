@@ -1,1 +1,0 @@
-$env:Path += ";C:\Program Files\Go\bin"
