@@ -20,18 +20,19 @@ import (
 )
 
 type EmailRequest struct {
-	APIKey    string
-	Username  string
-	Sender    string `json:"sender"`
-	Recipient string `json:"recipient"`
-	Subject   string `json:"subject"`
-	Body      string `json:"body"`
+	ContentType string `json:"contenttype"`
+	Sender      string `json:"sender"`
+	Recipient   string `json:"recipient"`
+	Subject     string `json:"subject"`
+	Body        string `json:"body"`
 }
 
 type newUserReq struct {
 	Email    string `json:"email"`
 	Username string `json:"username"`
-	IP       string "some IP"
+	IP       string
+	Password string
+	Token    string
 }
 
 type DB struct {
@@ -102,16 +103,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func sendEmail(req EmailRequest, rateLimiter *RateLimiter) error {
-
-	if rateLimiter.check(req.Username) == false {
-		return fmt.Errorf("429")
-	}
-
-	// if db.authenticateClient() == false {
-	// 	return fmt.Errorf("401")
-	// }
-
+func sendEmail(req EmailRequest) error {
 	_ = godotenv.Load()
 
 	if _, err := mail.ParseAddress(req.Recipient); err != nil {
@@ -137,7 +129,7 @@ func sendEmail(req EmailRequest, rateLimiter *RateLimiter) error {
 	msg := []byte("From: " + fromHeader + "\r\n" +
 		"To: " + req.Recipient + "\r\n" +
 		"Subject: " + req.Subject + "\r\n" +
-		"Content-Type: text/plain; charset=\"utf-8\"\r\n" +
+		"Content-Type: text/" + req.ContentType + "; charset=\"utf-8\"\r\n" +
 		"\r\n" +
 		req.Body + "\r\n")
 
@@ -162,10 +154,57 @@ func getIP(r *http.Request) string {
 	return host
 }
 
-func (db *DB) createUser(req newUserReq, rateLimiter *RateLimiter) error {
+func (db *DB) createUser(req newUserReq) error {
 
-	if rateLimiter.check(req.IP) == false {
-		return fmt.Errorf("429")
+	if req.Token != "" {
+		var exists bool
+
+		err := db.Conn.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM tokens WHERE token = ?
+			)
+		`, req.Token).Scan(&exists)
+
+		if err != nil {
+			return fmt.Errorf("302")
+		}
+
+		err = db.Conn.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM tokens WHERE ip = ?
+			)
+		`, req.IP).Scan(&exists)
+
+		if err != nil {
+			return fmt.Errorf("302")
+		}
+
+		if req.Password != "" {
+
+			_, err = db.Conn.Exec(`
+				INSERT INTO users (api_key, email, username, password)
+				VALUES (?, ?, ?, ?)
+			`, "this-is-a-placeholder-key-so-please-reset-it", req.Email, req.Username, req.Password) // dont worry, the password is hashed on client side already. if i rememebr to do it...
+
+			if err != nil {
+				return fmt.Errorf("500%s", err.Error())
+			}
+
+			_, err = db.Conn.Exec(`
+				DELETE FROM tokens WHERE token = ?
+			`, req.Token)
+
+			if err != nil {
+				return fmt.Errorf("500%s", err.Error())
+			}
+
+			return fmt.Errorf("success")
+		}
+
+		// give website html stuff thingy to create password
+
+		return nil
+
 	}
 
 	if _, err := mail.ParseAddress(req.Email); err != nil {
@@ -177,7 +216,7 @@ func (db *DB) createUser(req newUserReq, rateLimiter *RateLimiter) error {
 
 	err := db.Conn.QueryRow(`
         SELECT EXISTS(
-            SELECT 1 FROM clients WHERE email = ?
+            SELECT 1 FROM users WHERE email = ?
         )
     `, req.Email).Scan(&emailExists)
 
@@ -187,7 +226,7 @@ func (db *DB) createUser(req newUserReq, rateLimiter *RateLimiter) error {
 
 	err = db.Conn.QueryRow(`
         SELECT EXISTS(
-            SELECT 1 FROM clients WHERE username = ?
+            SELECT 1 FROM users WHERE username = ?
         )
     `, req.Username).Scan(&usernameExists)
 
@@ -195,23 +234,47 @@ func (db *DB) createUser(req newUserReq, rateLimiter *RateLimiter) error {
 		return fmt.Errorf("Username already exists!")
 	}
 
+	var eReq EmailRequest
+	eReq.Sender = "3272010 Authentication"
+	eReq.Recipient = req.Email
+	eReq.Subject = "Email Verification"
+	eReq.ContentType = "html"
+
 	b := make([]byte, 16)
 	rand.Read(b)
 
 	_, err = db.Conn.Exec(`
-		INSERT INTO users (id, email, api_key)
-		VALUES (?, ?, ?)
-	`, req.Username, req.Email, hex.EncodeToString(b)) // make api generate function better or something idk and hash it
+		INSERT INTO tokens (token, ip, username, email, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, hex.EncodeToString(b), req.IP, req.Username, req.Email, (time.Now().Unix() + 600)) // make cleanup function for tokens too later
 
-	return fmt.Errorf("500" + err.Error())
+	if err != nil {
+		return fmt.Errorf("500%s", err.Error())
+	}
+
+	content, err := os.ReadFile("link.html")
+	if err != nil {
+		return fmt.Errorf("500%s", err.Error())
+	}
+
+	text := string(content)
+	text = strings.ReplaceAll(text, "{{.VerifyURL}}", ("https://authenticator.3272010.xyz/createUser?token=" + hex.EncodeToString(b))) // reminder to change link
+	// text = strings.ReplaceAll(text, "{{.IP}}", req.IP)
+
+	eReq.Body = text
+
+	sendEmail(eReq)
+
+	return nil
 }
 
 func (db *DB) initDB() error {
 	_, err := db.Conn.Exec(`
         CREATE TABLE IF NOT EXISTS users (
-			username INTEGER PRIMARY KEY AUTOINCREMENT,
+			api_key TEXT PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
-			api_key TEXT NOT NULL UNIQUE
+			username TEXT NOT NULL UNIQUE,
+			password TEXT NOT NULL UNIQUE
 		);
     `)
 	if err != nil {
@@ -222,6 +285,8 @@ func (db *DB) initDB() error {
         CREATE TABLE tokens (
 			token TEXT PRIMARY KEY,
 			ip TEXT NOT NULL,
+			username TEXT NOT NULL UNIQUE,
+			email TEXT NOT NULL UNIQUE,
 			expires_at INTEGER NOT NULL
 		);
     `)
@@ -232,8 +297,14 @@ func (db *DB) initDB() error {
 	return nil
 }
 
-func (db *DB) authenticateClient(apikey, username string) {
+func (db *DB) authenticateClient(apikey string) bool {
+	if apikey == "this-is-a-placeholder-key-so-please-reset-it" {
+		return false
+	} else if len(apikey) < 16 {
+		return false
+	}
 	// do later
+	return true
 }
 
 func initRl() (signupRl *RateLimiter, reqRl *RateLimiter) {
@@ -292,33 +363,39 @@ func main() {
 			return
 		}
 
-		var req EmailRequest
+		if reqRl.check(getIP(r)) {
+			if db.authenticateClient(r.Header.Get("Authorization")) {
 
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
-			writeError(w, 500, "There was an error in parsing the JSON")
-			return
-		}
+				var req EmailRequest
 
-		if strings.ReplaceAll(req.Sender, " ", "") == "" {
-			req.Sender = "Authentication by 3272010.xyz"
-		}
-		if strings.ReplaceAll(req.Subject, " ", "") == "" {
-			req.Subject = "Authentication by 3272010.xyz"
-		}
+				err := json.NewDecoder(r.Body).Decode(&req)
+				if err != nil {
+					writeError(w, 500, "There was an error in parsing the JSON")
+					return
+				}
 
-		result := sendEmail(req, &reqRl) // omg bro im going to die. what am i doing wrong with this pointer
+				if strings.ReplaceAll(req.Sender, " ", "") == "" {
+					req.Sender = "Authentication by 3272010.xyz"
+				}
+				if strings.ReplaceAll(req.Subject, " ", "") == "" {
+					req.Subject = "Authentication by 3272010.xyz"
+				}
+				if strings.ReplaceAll(req.ContentType, " ", "") == "" {
+					req.Subject = "plain"
+				}
 
-		if result == nil {
-			writeJSON(w, 200, "success")
-		} else {
-			if result.Error() == "429" {
-				writeError(w, 429, "Too many requests. You are being rate limited.")
-			} else if result.Error() == "401" {
-				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key")
+				result := sendEmail(req) // btw i didn't rearrange all the code because i couldnt figure out what the problem with the pointers and addresses were; i figures that out pretty quick and called myself stupid. the actual reason i rearranged all this code was because of the sendEmail() function call in userCreate. i didnt want to do some stupid stuff to not give apikey so i just checked it here instead of the function and decided to check ratelimiting here too.
+
+				if result == nil {
+					writeJSON(w, 200, "success")
+				} else {
+					writeError(w, 500, result.Error())
+				}
 			} else {
-				writeError(w, 500, result.Error())
+				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key") // reminder to make this page
 			}
+		} else {
+			writeError(w, 429, "Too many requests. You are being rate limited.")
 		}
 
 	})
@@ -337,27 +414,32 @@ func main() {
 			return
 		}
 
-		var req newUserReq
+		if signupRl.check(getIP(r)) {
 
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, 400, "Invalid JSON")
-			return
-		}
+			var req newUserReq
 
-		req.IP = getIP(r)
-
-		result := db.createUser(req, &signupRl) // and this one
-
-		if result == nil {
-			writeJSON(w, 200, "success")
-		} else {
-			if result.Error() == "429" {
-				writeError(w, 429, "Too many requests. You are being rate limited.")
-			} else if result.Error()[:3] == "500" {
-				writeError(w, 500, result.Error()[3:])
-			} else {
-				writeError(w, 400, result.Error())
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, 400, "Invalid JSON")
+				return
 			}
+
+			result := db.createUser(req)
+
+			if result == nil {
+				writeJSON(w, 200, "success")
+			} else {
+				if result.Error()[:3] == "500" {
+					writeError(w, 500, result.Error()[3:])
+				} else if result.Error() == "302" {
+					http.Redirect(w, r, "/sign-up?invalidToken=1", 302)
+				} else if result.Error() == "success" {
+					http.Redirect(w, r, "/sign-in?success=1", 302)
+				} else {
+					writeError(w, 400, result.Error())
+				}
+			}
+		} else {
+			writeError(w, 429, "Too many requests. You are being rate limited.")
 		}
 
 	})
@@ -366,4 +448,4 @@ func main() {
 	http.ListenAndServe(":8080", mux)
 }
 
-// im not even going to compile. i havent compiled a single time today and im done bruh. this is the poorest developed api ever probably.
+// im not compiling or testing today either
