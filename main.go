@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,11 @@ type EmailRequest struct {
 	Recipient   string `json:"recipient"`
 	Subject     string `json:"subject"`
 	Body        string `json:"body"`
+}
+
+type TextRequest struct {
+	Recipient string `json:"recipient"`
+	Code      string `json:"code"`
 }
 
 type newUserReq struct {
@@ -73,7 +80,7 @@ func (rl *RateLimiter) cleanup() {
 	for range time.Tick(time.Minute) {
 		rl.mu.Lock()
 		for key, timestamps := range rl.clients {
-			if len(timestamps) == 0 || timestamps[len(timestamps)-1].Before(time.Now().Add(-rl.window)) {
+			if len(timestamps) == 0 || timestamps[len(timestamps)-1].Before(time.Now().Add(-rl.window)) { // honestly i probably should have used unix timestamps for this too but idrc
 				delete(rl.clients, key)
 			}
 		}
@@ -103,9 +110,12 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func sendEmail(req EmailRequest) error {
-	_ = godotenv.Load()
+func sendSMS(req TextRequest) error {
+	//do later
+	return nil
+}
 
+func sendEmail(req EmailRequest) error {
 	if _, err := mail.ParseAddress(req.Recipient); err != nil {
 		return fmt.Errorf("553")
 	}
@@ -166,7 +176,7 @@ func (db *DB) createUser(req newUserReq) error {
 		`, req.Token).Scan(&exists)
 
 		if err != nil {
-			return fmt.Errorf("302")
+			return fmt.Errorf("302invalid token") // spaces should automatically be encoded to %20 hopefully
 		}
 
 		err = db.Conn.QueryRow(`
@@ -176,10 +186,22 @@ func (db *DB) createUser(req newUserReq) error {
 		`, req.IP).Scan(&exists)
 
 		if err != nil {
-			return fmt.Errorf("302")
+			return fmt.Errorf("302ip mismatch")
 		}
 
 		if req.Password != "" {
+
+			// time to add annoying password safety checkers
+
+			matched, _ := regexp.MatchString(`[^a-zA-Z0-9]`, req.Password)
+
+			if len(req.Password) < 8 {
+				return fmt.Errorf("Password must be at least 8 characters long.")
+			} else if !strings.ContainsAny(req.Password, "1234567890") {
+				return fmt.Errorf("Password must have at least one number.")
+			} else if !matched {
+				return fmt.Errorf("Password must have at least one non-alphanumeric character.")
+			}
 
 			_, err = db.Conn.Exec(`
 				INSERT INTO users (api_key, email, username, password)
@@ -201,9 +223,7 @@ func (db *DB) createUser(req newUserReq) error {
 			return fmt.Errorf("success")
 		}
 
-		// give website html stuff thingy to create password
-
-		return nil
+		return fmt.Errorf("No password was provided.")
 
 	}
 
@@ -258,7 +278,7 @@ func (db *DB) createUser(req newUserReq) error {
 	}
 
 	text := string(content)
-	text = strings.ReplaceAll(text, "{{.VerifyURL}}", ("https://authenticator.3272010.xyz/createUser?token=" + hex.EncodeToString(b))) // reminder to change link
+	text = strings.ReplaceAll(text, "{{.VerifyURL}}", ("https://authenticator.3272010.xyz/set-password?token=" + hex.EncodeToString(b))) // reminder to change link
 	// text = strings.ReplaceAll(text, "{{.IP}}", req.IP)
 
 	eReq.Body = text
@@ -266,6 +286,18 @@ func (db *DB) createUser(req newUserReq) error {
 	sendEmail(eReq)
 
 	return nil
+}
+
+func (db *DB) cleanupTokens() {
+	for range time.Tick(time.Minute) {
+		_, err := db.Conn.Exec(`
+			DELETE FROM tokens WHERE expires_at < ?
+		`, time.Now().Unix())
+
+		if err != nil {
+			panic(err)
+		}
+	}
 }
 
 func (db *DB) initDB() error {
@@ -298,13 +330,32 @@ func (db *DB) initDB() error {
 }
 
 func (db *DB) authenticateClient(apikey string) bool {
-	if apikey == "this-is-a-placeholder-key-so-please-reset-it" {
-		return false
-	} else if len(apikey) < 16 {
-		return false
+	if len(apikey) == 16 {
+
+		hash := sha256.Sum256([]byte(apikey))
+		hex.EncodeToString(hash[:])
+
+		var exists bool
+
+		err := db.Conn.QueryRow(`
+				SELECT EXISTS(
+					SELECT 1 FROM users WHERE api_key = ?
+				)
+			`, hash).Scan(&exists)
+		if err != nil {
+			return false
+		}
+
+		return exists
+
 	}
-	// do later
-	return true
+
+	return false
+}
+
+func (db *DB) resetApiKey(username, password string) string {
+	//do later
+	return ""
 }
 
 func initRl() (signupRl *RateLimiter, reqRl *RateLimiter) {
@@ -342,6 +393,7 @@ func main() {
 		panic(err)
 	}
 	db.initDB()
+	go db.cleanupTokens()
 
 	signupRl, reqRl := initRl()
 
@@ -384,7 +436,7 @@ func main() {
 					req.Subject = "plain"
 				}
 
-				result := sendEmail(req) // btw i didn't rearrange all the code because i couldnt figure out what the problem with the pointers and addresses were; i figures that out pretty quick and called myself stupid. the actual reason i rearranged all this code was because of the sendEmail() function call in userCreate. i didnt want to do some stupid stuff to not give apikey so i just checked it here instead of the function and decided to check ratelimiting here too.
+				result := sendEmail(req)
 
 				if result == nil {
 					writeJSON(w, 200, "success")
@@ -423,6 +475,8 @@ func main() {
 				return
 			}
 
+			req.Token = r.PathValue("token")
+
 			result := db.createUser(req)
 
 			if result == nil {
@@ -430,10 +484,10 @@ func main() {
 			} else {
 				if result.Error()[:3] == "500" {
 					writeError(w, 500, result.Error()[3:])
-				} else if result.Error() == "302" {
-					http.Redirect(w, r, "/sign-up?invalidToken=1", 302)
+				} else if result.Error()[:3] == "302" {
+					http.Redirect(w, r, ("/sign-up?redir-reason=" + result.Error()[3:]), 302)
 				} else if result.Error() == "success" {
-					http.Redirect(w, r, "/sign-in?success=1", 302)
+					http.Redirect(w, r, "/log-in?success=1", 302)
 				} else {
 					writeError(w, 400, result.Error())
 				}
@@ -445,7 +499,9 @@ func main() {
 	})
 
 	fmt.Println("Server running on http://localhost:8080")
+	http.Handle("/", http.FileServer(http.Dir("./static"))) //idk if this will override the api functions but hopefully not
 	http.ListenAndServe(":8080", mux)
 }
 
-// im not compiling or testing today either
+// im not compiling or testing today either. reminder to make api key resetting.
+// still didnt compile today, too scared
