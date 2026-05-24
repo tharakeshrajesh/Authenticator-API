@@ -6,12 +6,11 @@
 
       <div style="background:#0C447C;padding:2rem;text-align:center;">
         <p style="color:#fff;font-size:18px;font-weight:500;margin:0;">Verify your email</p>
-        <p style="color:rgba(255,255,255,0.7);font-size:13px;margin:6px 0 0;">3272010.xyz</p>
       </div>
 
       <div style="padding:2rem;">
         <p style="font-size:15px;color:#111;margin:0 0 6px;">Hi there,</p>
-        <p style="font-size:14px;color:#555;line-height:1.6;margin:0 0 1.5rem;">Thanks for signing up. Click the button below to verify your email address and activate your account. This link expires in <span style="color:#111;font-weight:500;">10 minutes</span>.</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;margin:0 0 1.5rem;">Click the button below to verify your email address and activate your account. This link expires in <span style="color:#111;font-weight:500;">{{.Expiration}}</span>.</p>
 
         <div style="text-align:center;margin:1.5rem 0;">
           <a href="{{.VerifyURL}}" style="display:inline-block;background:#185FA5;color:#fff;font-size:15px;font-weight:500;padding:12px 32px;border-radius:8px;text-decoration:none;">Verify my email</a>
@@ -28,7 +27,7 @@
       </div>
 
       <div style="padding:1rem 2rem;border-top:1px solid #e5e5e5;text-align:center;">
-        <p style="font-size:12px;color:#aaa;margin:0;">© 2026 3272010.xyz</p>
+        <p style="font-size:12px;color:#aaa;margin:0;">© 2026 <a href="https://authenticator.3272010.xyz">3272010.xyz</a></p>
       </div>
 
     </div>

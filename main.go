@@ -22,11 +22,13 @@ import (
 )
 
 type EmailRequest struct {
-	ContentType string `json:"contenttype"`
+	ContentType string
 	Sender      string `json:"sender"`
 	Recipient   string `json:"recipient"`
 	Subject     string `json:"subject"`
 	Body        string `json:"body"`
+	Expiration  string `json:"expiration"`
+	Template    string `json:"template"`
 }
 
 type TextRequest struct {
@@ -135,6 +137,16 @@ func sendEmail(req EmailRequest) error {
 	addr := host + ":587"
 
 	auth := smtp.PlainAuth("", email, pass, host)
+
+	content, err := os.ReadFile("./templates/" + req.Template + ".html")
+	if err != nil {
+		return err
+	}
+
+	text := string(content)
+	text = strings.ReplaceAll(text, "{{.VerifyURL}}", req.Body)
+	text = strings.ReplaceAll(text, "{{.OTPCode}}", req.Body)
+	text = strings.ReplaceAll(text, "{{.Expiration}}", req.Expiration)
 
 	msg := []byte("From: " + fromHeader + "\r\n" +
 		"To: " + req.Recipient + "\r\n" +
@@ -263,25 +275,7 @@ func (db *DB) createUser(req newUserReq) error {
 	b := make([]byte, 16)
 	rand.Read(b)
 
-	_, err = db.Conn.Exec(`
-		INSERT INTO tokens (token, ip, username, email, expires_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, hex.EncodeToString(b), req.IP, req.Username, req.Email, (time.Now().Unix() + 600)) // make cleanup function for tokens too later
-
-	if err != nil {
-		return fmt.Errorf("500%s", err.Error())
-	}
-
-	content, err := os.ReadFile("link.html")
-	if err != nil {
-		return fmt.Errorf("500%s", err.Error())
-	}
-
-	text := string(content)
-	text = strings.ReplaceAll(text, "{{.VerifyURL}}", ("https://authenticator.3272010.xyz/set-password?token=" + hex.EncodeToString(b))) // reminder to change link
-	// text = strings.ReplaceAll(text, "{{.IP}}", req.IP)
-
-	eReq.Body = text
+	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + hex.EncodeToString(b) // reminder to change link
 
 	sendEmail(eReq)
 
@@ -377,7 +371,7 @@ func initRl() (signupRl *RateLimiter, reqRl *RateLimiter) {
 }
 
 func newSqlDb() (*DB, error) {
-	conn, err := sql.Open("sqlite3", "api-keys.db")
+	conn, err := sql.Open("sqlite3", ".db")
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +396,7 @@ func main() {
 	mux.HandleFunc("/sendEmail/", func(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == http.MethodOptions {
@@ -432,8 +426,19 @@ func main() {
 				if strings.ReplaceAll(req.Subject, " ", "") == "" {
 					req.Subject = "Authentication by 3272010.xyz"
 				}
-				if strings.ReplaceAll(req.ContentType, " ", "") == "" {
-					req.Subject = "plain"
+				if strings.ReplaceAll(req.Body, " ", "") == "" {
+					writeError(w, 400, "Invalid body provided.")
+					return
+				}
+				if req.Template != "" {
+					_, err := os.Stat("./templates/" + req.Template + ".html")
+					if os.IsNotExist(err) {
+						writeError(w, 400, "Provided template does not exist.")
+						return
+					}
+					req.ContentType = "html"
+				} else {
+					req.ContentType = "plain"
 				}
 
 				result := sendEmail(req)
@@ -503,5 +508,4 @@ func main() {
 	http.ListenAndServe(":8080", mux)
 }
 
-// im not compiling or testing today either. reminder to make api key resetting.
-// still didnt compile today, too scared
+// time to compile
