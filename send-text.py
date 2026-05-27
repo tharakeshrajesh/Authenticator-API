@@ -41,3 +41,5 @@ print(loads(thing3.text)["result"])
 
 # sorry for reverse engineering this website but it was my last option
 # i cant show which site or how so i have to encrypt, sorry guys
+
+# update: bruh they patched it already, its only been like 2 days

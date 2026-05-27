@@ -12,6 +12,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -113,8 +114,15 @@ func writeError(w http.ResponseWriter, status int, message string) {
 }
 
 func sendSMS(req TextRequest) error {
-	//do later
-	return nil
+	out, err := exec.Command("python", "send-text.py", req.Recipient, req.Code).Output() // i really need to find a better way than running slow python everytime
+	if err != nil {
+		return fmt.Errorf("500%s", err.Error())
+	}
+	if string(out) == "success" {
+		return nil
+	}
+	fmt.Println(string(out))
+	return fmt.Errorf(string(out))
 }
 
 func sendEmail(req EmailRequest) error {
@@ -215,10 +223,13 @@ func (db *DB) createUser(req newUserReq) error {
 				return fmt.Errorf("Password must have at least one non-alphanumeric character.")
 			}
 
+			hash := sha256.Sum256([]byte(req.Password))
+			req.Password = hex.EncodeToString(hash[:])
+
 			_, err = db.Conn.Exec(`
 				INSERT INTO users (api_key, email, username, password)
 				VALUES (?, ?, ?, ?)
-			`, "this-is-a-placeholder-key-so-please-reset-it", req.Email, req.Username, req.Password) // dont worry, the password is hashed on client side already. if i rememebr to do it...
+			`, "this-is-a-placeholder-key-so-please-reset-it", req.Email, req.Username, req.Password) // nvm im stupid, server needs to hash it for security
 
 			if err != nil {
 				return fmt.Errorf("500%s", err.Error())
@@ -266,15 +277,23 @@ func (db *DB) createUser(req newUserReq) error {
 		return fmt.Errorf("Username already exists!")
 	}
 
+	b := make([]byte, 16)
+	rand.Read(b)
+
+	_, err = db.Conn.Exec(`
+		INSERT INTO tokens (token, ip, username, email, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, hex.EncodeToString(b), req.IP, req.Username, req.Email, (time.Now().Unix() + 600))
+
+	if err != nil {
+		return err
+	}
+
 	var eReq EmailRequest
 	eReq.Sender = "3272010 Authentication"
 	eReq.Recipient = req.Email
 	eReq.Subject = "Email Verification"
 	eReq.ContentType = "html"
-
-	b := make([]byte, 16)
-	rand.Read(b)
-
 	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + hex.EncodeToString(b) // reminder to change link
 
 	sendEmail(eReq)
@@ -300,7 +319,8 @@ func (db *DB) initDB() error {
 			api_key TEXT PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
 			username TEXT NOT NULL UNIQUE,
-			password TEXT NOT NULL UNIQUE
+			password TEXT NOT NULL UNIQUE,
+			requestsperday TEXT NOT NULL
 		);
     `)
 	if err != nil {
@@ -347,12 +367,37 @@ func (db *DB) authenticateClient(apikey string) bool {
 	return false
 }
 
-func (db *DB) resetApiKey(username, password string) string {
-	//do later
-	return ""
+func (db *DB) resetApiKey(username, password string) (string, error) {
+	hash := sha256.Sum256([]byte(password))
+	password = hex.EncodeToString(hash[:])
+	var dbpassword string
+
+	err := db.Conn.QueryRow(`
+		SELECT password FROM users WHERE username = ?
+	`, username).Scan(&dbpassword)
+
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("User not found")
+	} else if dbpassword != password {
+		return "", fmt.Errorf("Incorrect password") // reminder to rate limit this so no brute forcing
+	}
+
+	b := make([]byte, 16)
+	rand.Read(b)
+	newApiKey := hex.EncodeToString(b)
+
+	_, err = db.Conn.Exec(`
+		UPDATE users SET api_key = ? WHERE username = ?
+	`, newApiKey, username)
+
+	if err != nil {
+		return "", err
+	}
+
+	return newApiKey, nil
 }
 
-func initRl() (signupRl *RateLimiter, reqRl *RateLimiter) {
+func initRl() (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *RateLimiter) {
 	SRl := RateLimiter{
 		clients: make(map[string][]time.Time),
 		limit:   10,
@@ -367,7 +412,14 @@ func initRl() (signupRl *RateLimiter, reqRl *RateLimiter) {
 	}
 	go RRl.cleanup()
 
-	return &SRl, &RRl
+	DRl := RateLimiter{
+		clients: make(map[string][]time.Time),
+		limit:   50,
+		window:  (time.Duration(24) * time.Hour),
+	}
+	go DRl.cleanup()
+
+	return &SRl, &RRl, &DRl
 }
 
 func newSqlDb() (*DB, error) {
@@ -389,7 +441,7 @@ func main() {
 	db.initDB()
 	go db.cleanupTokens()
 
-	signupRl, reqRl := initRl()
+	signupRl, reqRl, dailyLimit := initRl()
 
 	mux := http.NewServeMux()
 
@@ -411,48 +463,77 @@ func main() {
 
 		if reqRl.check(getIP(r)) {
 			if db.authenticateClient(r.Header.Get("Authorization")) {
+				if reqRl.check(r.Header.Get("Authorization")) && dailyLimit.check(r.Header.Get("Authorization")) {
 
-				var req EmailRequest
+					var req EmailRequest
 
-				err := json.NewDecoder(r.Body).Decode(&req)
-				if err != nil {
-					writeError(w, 500, "There was an error in parsing the JSON")
-					return
-				}
-
-				if strings.ReplaceAll(req.Sender, " ", "") == "" {
-					req.Sender = "Authentication by 3272010.xyz"
-				}
-				if strings.ReplaceAll(req.Subject, " ", "") == "" {
-					req.Subject = "Authentication by 3272010.xyz"
-				}
-				if strings.ReplaceAll(req.Body, " ", "") == "" {
-					writeError(w, 400, "Invalid body provided.")
-					return
-				}
-				if req.Template != "" {
-					_, err := os.Stat("./templates/" + req.Template + ".html")
-					if os.IsNotExist(err) {
-						writeError(w, 400, "Provided template does not exist.")
+					err := json.NewDecoder(r.Body).Decode(&req)
+					if err != nil {
+						writeError(w, 500, "There was an error in parsing the JSON")
 						return
 					}
-					req.ContentType = "html"
-				} else {
-					req.ContentType = "plain"
-				}
 
-				result := sendEmail(req)
+					if strings.ReplaceAll(req.Sender, " ", "") == "" {
+						req.Sender = "Authentication by 3272010.xyz"
+					}
+					if strings.ReplaceAll(req.Subject, " ", "") == "" {
+						req.Subject = "Authentication by 3272010.xyz"
+					}
+					if strings.ReplaceAll(req.Body, " ", "") == "" {
+						writeError(w, 400, "Invalid body provided.")
+						return
+					}
+					if req.Template != "" {
+						_, err := os.Stat("./templates/" + req.Template + ".html")
+						if os.IsNotExist(err) {
+							writeError(w, 400, "Provided template does not exist.")
+							return
+						}
+						req.ContentType = "html"
+					} else {
+						req.ContentType = "plain"
+					}
 
-				if result == nil {
-					writeJSON(w, 200, "success")
+					result := sendEmail(req)
+
+					if result == nil {
+						writeJSON(w, 200, "success")
+					} else {
+						writeError(w, 500, result.Error())
+					}
 				} else {
-					writeError(w, 500, result.Error())
+					writeError(w, 429, "Too many requests. You are being rate limited.")
 				}
 			} else {
 				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key") // reminder to make this page
 			}
 		} else {
 			writeError(w, 429, "Too many requests. You are being rate limited.")
+		}
+
+	})
+
+	mux.HandleFunc("/sendText/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET") // testing purposes only, reminder to change later
+		// w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		var req TextRequest
+
+		req.Code = r.PathValue("code")
+		req.Recipient = r.PathValue("number")
+
+		result := sendSMS(req)
+
+		if result != nil {
+			if result.Error()[:3] == "500" {
+				writeError(w, 500, result.Error()[3:])
+				return
+			}
+			writeError(w, 400, result.Error())
+			return
+		} else {
+			writeJSON(w, 200, "success")
 		}
 
 	})
