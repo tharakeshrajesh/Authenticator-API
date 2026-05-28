@@ -79,6 +79,28 @@ func (rl *RateLimiter) check(key string) bool {
 
 }
 
+func (rl *RateLimiter) quota(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	valid := rl.clients[key][:0]
+
+	for _, t := range rl.clients[key] {
+		if t.After(now.Add(-rl.window)) {
+			valid = append(valid, t)
+		}
+	}
+
+	if len(valid) >= rl.limit {
+		rl.clients[key] = valid
+		return false
+	}
+
+	rl.clients[key] = append(valid, now)
+	return true
+}
+
 func (rl *RateLimiter) cleanup() {
 	for range time.Tick(time.Minute) {
 		rl.mu.Lock()
@@ -444,6 +466,7 @@ func main() {
 	signupRl, reqRl, dailyLimit := initRl()
 
 	mux := http.NewServeMux()
+	site := http.NewServeMux()
 
 	mux.HandleFunc("/sendEmail/", func(w http.ResponseWriter, r *http.Request) {
 
@@ -463,52 +486,56 @@ func main() {
 
 		if reqRl.check(getIP(r)) {
 			if db.authenticateClient(r.Header.Get("Authorization")) {
-				if reqRl.check(r.Header.Get("Authorization")) && dailyLimit.check(r.Header.Get("Authorization")) {
+				if reqRl.check(r.Header.Get("Authorization")) {
+					if dailyLimit.check(r.Header.Get("Authorization")) {
 
-					var req EmailRequest
+						var req EmailRequest
 
-					err := json.NewDecoder(r.Body).Decode(&req)
-					if err != nil {
-						writeError(w, 500, "There was an error in parsing the JSON")
-						return
-					}
-
-					if strings.ReplaceAll(req.Sender, " ", "") == "" {
-						req.Sender = "Authentication by 3272010.xyz"
-					}
-					if strings.ReplaceAll(req.Subject, " ", "") == "" {
-						req.Subject = "Authentication by 3272010.xyz"
-					}
-					if strings.ReplaceAll(req.Body, " ", "") == "" {
-						writeError(w, 400, "Invalid body provided.")
-						return
-					}
-					if req.Template != "" {
-						_, err := os.Stat("./templates/" + req.Template + ".html")
-						if os.IsNotExist(err) {
-							writeError(w, 400, "Provided template does not exist.")
+						err := json.NewDecoder(r.Body).Decode(&req)
+						if err != nil {
+							writeError(w, 500, "There was an error in parsing the JSON")
 							return
 						}
-						req.ContentType = "html"
-					} else {
-						req.ContentType = "plain"
-					}
 
-					result := sendEmail(req)
+						if strings.ReplaceAll(req.Sender, " ", "") == "" {
+							req.Sender = "Authentication by 3272010.xyz"
+						}
+						if strings.ReplaceAll(req.Subject, " ", "") == "" {
+							req.Subject = "Authentication by 3272010.xyz"
+						}
+						if strings.ReplaceAll(req.Body, " ", "") == "" {
+							writeError(w, 400, "Invalid body provided.")
+							return
+						}
+						if req.Template != "" {
+							_, err := os.Stat("./templates/" + req.Template + ".html")
+							if os.IsNotExist(err) {
+								writeError(w, 400, "Provided template does not exist.")
+								return
+							}
+							req.ContentType = "html"
+						} else {
+							req.ContentType = "plain"
+						}
 
-					if result == nil {
-						writeJSON(w, 200, "success")
+						result := sendEmail(req)
+
+						if result == nil {
+							writeJSON(w, 200, "success")
+						} else {
+							writeError(w, 500, result.Error())
+						}
 					} else {
-						writeError(w, 500, result.Error())
+						writeError(w, 429, "You have hit the daily limit of free requests.")
 					}
 				} else {
 					writeError(w, 429, "Too many requests. You are being rate limited.")
 				}
 			} else {
-				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key") // reminder to make this page
+				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key")
 			}
 		} else {
-			writeError(w, 429, "Too many requests. You are being rate limited.")
+			writeError(w, 429, "Too many requests. This IP is being rate limited.")
 		}
 
 	})
@@ -584,9 +611,26 @@ func main() {
 
 	})
 
-	fmt.Println("Server running on http://localhost:8080")
-	http.Handle("/", http.FileServer(http.Dir("./static"))) //idk if this will override the api functions but hopefully not
-	http.ListenAndServe(":8080", mux)
+	site.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		path := "./static" + r.URL.Path
+
+		if _, err := os.Stat(path); err == nil {
+			http.ServeFile(w, r, path)
+			return
+		}
+
+		if _, err := os.Stat(path + ".html"); err == nil {
+			http.ServeFile(w, r, path+".html")
+			return
+		}
+
+		http.ServeFile(w, r, "./static/404.html")
+	})
+
+	go http.ListenAndServe(":8080", mux)
+	fmt.Println("API running on http://localhost:8080")
+	http.ListenAndServe(":3000", site)
+	fmt.Println("Site running on http://localhost:3000")
 }
 
 // time to compile
