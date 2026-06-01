@@ -57,6 +57,12 @@ type RateLimiter struct {
 	window  time.Duration
 }
 
+type DailyLimit struct {
+	mu      sync.Mutex
+	clients map[string][]time.Time
+	Conn    *sql.DB
+}
+
 func (rl *RateLimiter) check(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -80,40 +86,46 @@ func (rl *RateLimiter) check(key string) bool {
 
 }
 
-func (rl *RateLimiter) dailyLimitCheck(key string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+func (dl *DailyLimit) dailyLimitCheck(apikey string) bool {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
 
 	now := time.Now()
-	valid := rl.clients[key][:0]
+	valid := dl.clients[apikey][:0]
 
-	for _, t := range rl.clients[key] {
-		if t.After(now.Add(-rl.window)) {
+	for _, t := range dl.clients[apikey] {
+		if t.After(now.Add(-(time.Duration(24) * time.Hour))) {
 			valid = append(valid, t)
 		}
 	}
 
-	if len(valid) >= rl.limit {
+	var limit int = 15
+
+	dl.Conn.QueryRow(`
+		SELECT reqsperday FROM users WHERE api_key = ?
+	`, apikey).Scan(&limit)
+
+	if len(valid) >= limit {
 		return false
 	}
 
 	return true
 }
 
-func (rl *RateLimiter) dailyLimitAdd(key string) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+func (dl *DailyLimit) dailyLimitAdd(key string) {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
 
 	now := time.Now()
-	valid := rl.clients[key][:0]
+	valid := dl.clients[key][:0]
 
-	for _, t := range rl.clients[key] {
-		if t.After(now.Add(-rl.window)) {
+	for _, t := range dl.clients[key] {
+		if t.After(now.Add(-(time.Duration(24) * time.Hour))) {
 			valid = append(valid, t)
 		}
 	}
 
-	rl.clients[key] = append(valid, now)
+	dl.clients[key] = append(valid, now)
 }
 
 func (rl *RateLimiter) quota(key string) bool {
@@ -147,6 +159,18 @@ func (rl *RateLimiter) cleanup() {
 			}
 		}
 		rl.mu.Unlock()
+	}
+}
+
+func (dl *DailyLimit) cleanup() {
+	for range time.Tick(time.Minute) {
+		dl.mu.Lock()
+		for key, timestamps := range dl.clients {
+			if len(timestamps) == 0 || timestamps[len(timestamps)-1].Before(time.Now().Add(-(time.Duration(24) * time.Hour))) {
+				delete(dl.clients, key)
+			}
+		}
+		dl.mu.Unlock()
 	}
 }
 
@@ -307,9 +331,9 @@ func (db *DB) createUser(req newUserReq) error {
 			apiKey := hex.EncodeToString(b)
 
 			_, err = db.Conn.Exec(`
-				INSERT INTO users (api_key, email, username, password)
-				VALUES (?, ?, ?, ?)
-			`, apiKey, req.Email, req.Username, req.Password)
+				INSERT INTO users (api_key, email, username, password, reqsperday)
+				VALUES (?, ?, ?, , ??)
+			`, apiKey, req.Email, req.Username, req.Password, 15)
 
 			if err != nil {
 				return fmt.Errorf("500%s", err.Error())
@@ -408,7 +432,8 @@ func (db *DB) initDB() error {
 			api_key TEXT PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
 			username TEXT NOT NULL UNIQUE,
-			password TEXT NOT NULL UNIQUE
+			password TEXT NOT NULL UNIQUE,
+			reqsperday INT NOT NULL
 		);
     `)
 	if err != nil {
@@ -418,9 +443,10 @@ func (db *DB) initDB() error {
 	_, err = db.Conn.Exec(`
         CREATE TABLE tokens (
 			token TEXT PRIMARY KEY,
-			ip TEXT NOT NULL,
-			username TEXT NOT NULL UNIQUE,
-			email TEXT NOT NULL UNIQUE,
+			ip TEXT,
+			device TEXT,
+			username TEXT NOT NULL,
+			email TEXT NOT NULL,
 			expires_at INTEGER NOT NULL
 		);
     `)
@@ -481,7 +507,7 @@ func (db *DB) resetApiKey(username, password string) (string, error) {
 	return newApiKey, nil
 }
 
-func initRl() (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *RateLimiter) {
+func initRl(db *DB) (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *DailyLimit) {
 	SRl := RateLimiter{
 		clients: make(map[string][]time.Time),
 		limit:   10,
@@ -496,14 +522,13 @@ func initRl() (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *RateLimite
 	}
 	go RRl.cleanup()
 
-	DRl := RateLimiter{
+	dl := DailyLimit{
 		clients: make(map[string][]time.Time),
-		limit:   50,
-		window:  (time.Duration(24) * time.Hour),
+		Conn:    db.Conn,
 	}
-	go DRl.cleanup()
+	go dl.cleanup()
 
-	return &SRl, &RRl, &DRl
+	return &SRl, &RRl, &dl
 }
 
 func newSqlDb() (*DB, error) {
@@ -525,7 +550,7 @@ func main() {
 	db.initDB()
 	go db.cleanupTokens()
 
-	signupRl, reqRl, dailyLimit := initRl()
+	signupRl, reqRl, dailyLimit := initRl(db)
 
 	mux := http.NewServeMux()
 	site := http.NewServeMux()
@@ -652,25 +677,7 @@ func main() {
 		}
 	})
 
-	mux.HandleFunc("/ip/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		writeJSON(w, 200, getIP(r))
-	})
-
-	mux.HandleFunc("/createUser/", func(w http.ResponseWriter, r *http.Request) { // thinking about changing it from api subdomain to regular one (mux to site)
+	site.HandleFunc("/createUser/", func(w http.ResponseWriter, r *http.Request) {
 		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST")
