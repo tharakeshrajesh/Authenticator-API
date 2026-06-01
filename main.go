@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -40,9 +41,9 @@ type TextRequest struct {
 type newUserReq struct {
 	Email    string `json:"email"`
 	Username string `json:"username"`
+	Password string `json:"password"`
+	Token    string `json:"token"`
 	IP       string
-	Password string
-	Token    string
 }
 
 type DB struct {
@@ -77,6 +78,42 @@ func (rl *RateLimiter) check(key string) bool {
 	rl.clients[key] = append(valid, now)
 	return true
 
+}
+
+func (rl *RateLimiter) dailyLimitCheck(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	valid := rl.clients[key][:0]
+
+	for _, t := range rl.clients[key] {
+		if t.After(now.Add(-rl.window)) {
+			valid = append(valid, t)
+		}
+	}
+
+	if len(valid) >= rl.limit {
+		return false
+	}
+
+	return true
+}
+
+func (rl *RateLimiter) dailyLimitAdd(key string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	valid := rl.clients[key][:0]
+
+	for _, t := range rl.clients[key] {
+		if t.After(now.Add(-rl.window)) {
+			valid = append(valid, t)
+		}
+	}
+
+	rl.clients[key] = append(valid, now)
 }
 
 func (rl *RateLimiter) quota(key string) bool {
@@ -122,9 +159,6 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 func writeError(w http.ResponseWriter, status int, message string) {
 
 	switch message[:3] {
-	case "553":
-		message = "An invalid recipient email address was given."
-		status = 400
 	case "555":
 		message = "A recipient email address may not have been provided."
 		status = 400
@@ -148,9 +182,6 @@ func sendSMS(req TextRequest) error {
 }
 
 func sendEmail(req EmailRequest) error {
-	if _, err := mail.ParseAddress(req.Recipient); err != nil {
-		return fmt.Errorf("553")
-	}
 
 	pass := os.Getenv("SMTP_PASS")
 	email := os.Getenv("SMTP_EMAIL")
@@ -168,15 +199,24 @@ func sendEmail(req EmailRequest) error {
 
 	auth := smtp.PlainAuth("", email, pass, host)
 
-	content, err := os.ReadFile("./templates/" + req.Template + ".html")
-	if err != nil {
-		return err
-	}
+	if req.ContentType == "html" {
+		content, err := os.ReadFile("./templates/" + req.Template + ".html")
+		if err != nil {
+			return err
+		}
 
-	text := string(content)
-	text = strings.ReplaceAll(text, "{{.VerifyURL}}", req.Body)
-	text = strings.ReplaceAll(text, "{{.OTPCode}}", req.Body)
-	text = strings.ReplaceAll(text, "{{.Expiration}}", req.Expiration)
+		if req.Expiration == "" {
+			req.Expiration = "sometime"
+		} else if len(req.Expiration) > 10 {
+			req.Expiration = req.Expiration[:10]
+		}
+
+		text := string(content)
+		text = strings.ReplaceAll(text, "{{.VerifyURL}}", req.Body)
+		text = strings.ReplaceAll(text, "{{.OTPCode}}", req.Body)
+		text = strings.ReplaceAll(text, "{{.Expiration}}", req.Expiration)
+		req.Body = text
+	}
 
 	msg := []byte("From: " + fromHeader + "\r\n" +
 		"To: " + req.Recipient + "\r\n" +
@@ -217,8 +257,8 @@ func (db *DB) createUser(req newUserReq) error {
 			)
 		`, req.Token).Scan(&exists)
 
-		if err != nil {
-			return fmt.Errorf("302invalid token") // spaces should automatically be encoded to %20 hopefully
+		if err != nil || !exists {
+			return fmt.Errorf("302invalid%20token") // spaces should automatically be encoded to %20 hopefully. edit: it does but just to be safe im harcoding it in.
 		}
 
 		err = db.Conn.QueryRow(`
@@ -227,8 +267,8 @@ func (db *DB) createUser(req newUserReq) error {
 			)
 		`, req.IP).Scan(&exists)
 
-		if err != nil {
-			return fmt.Errorf("302ip mismatch")
+		if err != nil || !exists { // thinking about removing this
+			return fmt.Errorf("302ip%20mismatch")
 		}
 
 		if req.Password != "" {
@@ -236,6 +276,8 @@ func (db *DB) createUser(req newUserReq) error {
 			// time to add annoying password safety checkers
 
 			matched, _ := regexp.MatchString(`[^a-zA-Z0-9]`, req.Password)
+			lowercase, _ := regexp.MatchString("[a-z]", req.Password)
+			uppercase, _ := regexp.MatchString(`[A-Z]`, req.Password)
 
 			if len(req.Password) < 8 {
 				return fmt.Errorf("Password must be at least 8 characters long.")
@@ -243,15 +285,31 @@ func (db *DB) createUser(req newUserReq) error {
 				return fmt.Errorf("Password must have at least one number.")
 			} else if !matched {
 				return fmt.Errorf("Password must have at least one non-alphanumeric character.")
+			} else if !lowercase {
+				return fmt.Errorf("Password must have at least one lowercase character.")
+			} else if !uppercase {
+				return fmt.Errorf("Password must have at least one uppercase character.")
 			}
 
 			hash := sha256.Sum256([]byte(req.Password))
 			req.Password = hex.EncodeToString(hash[:])
 
+			err = db.Conn.QueryRow(`
+				SELECT email, username FROM tokens WHERE token = ?
+			`, req.Token).Scan(&req.Email, &req.Username)
+
+			if err != nil {
+				return fmt.Errorf("500%s", err.Error())
+			}
+
+			b := make([]byte, 16)
+			rand.Read(b)
+			apiKey := hex.EncodeToString(b)
+
 			_, err = db.Conn.Exec(`
 				INSERT INTO users (api_key, email, username, password)
 				VALUES (?, ?, ?, ?)
-			`, "this-is-a-placeholder-key-so-please-reset-it", req.Email, req.Username, req.Password) // nvm im stupid, server needs to hash it for security
+			`, apiKey, req.Email, req.Username, req.Password)
 
 			if err != nil {
 				return fmt.Errorf("500%s", err.Error())
@@ -285,7 +343,7 @@ func (db *DB) createUser(req newUserReq) error {
         )
     `, req.Email).Scan(&emailExists)
 
-	if err != nil {
+	if err != nil || emailExists {
 		return fmt.Errorf("An account with this email already exists!")
 	}
 
@@ -295,7 +353,7 @@ func (db *DB) createUser(req newUserReq) error {
         )
     `, req.Username).Scan(&usernameExists)
 
-	if err != nil {
+	if err != nil || usernameExists {
 		return fmt.Errorf("Username already exists!")
 	}
 
@@ -308,6 +366,9 @@ func (db *DB) createUser(req newUserReq) error {
 	`, hex.EncodeToString(b), req.IP, req.Username, req.Email, (time.Now().Unix() + 600))
 
 	if err != nil {
+		if err.Error() == "UNIQUE constraint failed: tokens.email" || err.Error() == "UNIQUE constraint failed: tokens.username" {
+			return fmt.Errorf("An email request was already sent!")
+		}
 		return err
 	}
 
@@ -316,9 +377,15 @@ func (db *DB) createUser(req newUserReq) error {
 	eReq.Recipient = req.Email
 	eReq.Subject = "Email Verification"
 	eReq.ContentType = "html"
+	eReq.Template = "link"
+	eReq.Expiration = "5 minutes"
 	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + hex.EncodeToString(b) // reminder to change link
 
-	sendEmail(eReq)
+	err = sendEmail(eReq)
+
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -341,8 +408,7 @@ func (db *DB) initDB() error {
 			api_key TEXT PRIMARY KEY,
 			email TEXT NOT NULL UNIQUE,
 			username TEXT NOT NULL UNIQUE,
-			password TEXT NOT NULL UNIQUE,
-			requestsperday TEXT NOT NULL
+			password TEXT NOT NULL UNIQUE
 		);
     `)
 	if err != nil {
@@ -366,18 +432,14 @@ func (db *DB) initDB() error {
 }
 
 func (db *DB) authenticateClient(apikey string) bool {
-	if len(apikey) == 16 {
-
-		hash := sha256.Sum256([]byte(apikey))
-		hex.EncodeToString(hash[:])
-
+	if len(apikey) == 32 {
 		var exists bool
 
 		err := db.Conn.QueryRow(`
 				SELECT EXISTS(
 					SELECT 1 FROM users WHERE api_key = ?
 				)
-			`, hash).Scan(&exists)
+			`, apikey).Scan(&exists)
 		if err != nil {
 			return false
 		}
@@ -487,7 +549,7 @@ func main() {
 		if reqRl.check(getIP(r)) {
 			if db.authenticateClient(r.Header.Get("Authorization")) {
 				if reqRl.check(r.Header.Get("Authorization")) {
-					if dailyLimit.check(r.Header.Get("Authorization")) {
+					if dailyLimit.dailyLimitCheck(r.Header.Get("Authorization")) {
 
 						var req EmailRequest
 
@@ -497,11 +559,9 @@ func main() {
 							return
 						}
 
-						if strings.ReplaceAll(req.Sender, " ", "") == "" {
-							req.Sender = "Authentication by 3272010.xyz"
-						}
-						if strings.ReplaceAll(req.Subject, " ", "") == "" {
-							req.Subject = "Authentication by 3272010.xyz"
+						if _, err := mail.ParseAddress(req.Recipient); err != nil {
+							writeError(w, 400, "An invalid recipient email address was given.")
+							return
 						}
 						if strings.ReplaceAll(req.Body, " ", "") == "" {
 							writeError(w, 400, "Invalid body provided.")
@@ -510,18 +570,25 @@ func main() {
 						if req.Template != "" {
 							_, err := os.Stat("./templates/" + req.Template + ".html")
 							if os.IsNotExist(err) {
-								writeError(w, 400, "Provided template does not exist.")
+								writeError(w, 400, "Invalid template.")
 								return
 							}
 							req.ContentType = "html"
 						} else {
 							req.ContentType = "plain"
 						}
+						if strings.ReplaceAll(req.Sender, " ", "") == "" {
+							req.Sender = "Authentication by 3272010.xyz"
+						}
+						if strings.ReplaceAll(req.Subject, " ", "") == "" {
+							req.Subject = "Authentication by 3272010.xyz"
+						}
 
 						result := sendEmail(req)
 
 						if result == nil {
 							writeJSON(w, 200, "success")
+							dailyLimit.dailyLimitAdd(r.Header.Get("Authorization"))
 						} else {
 							writeError(w, 500, result.Error())
 						}
@@ -532,7 +599,7 @@ func main() {
 					writeError(w, 429, "Too many requests. You are being rate limited.")
 				}
 			} else {
-				writeError(w, 401, "API key not provided. Unauthorized. https://3272010.xyz/free-api-key")
+				writeError(w, 401, "API key not provided. Unauthorized. https://authenticator.3272010.xyz/free-api-key")
 			}
 		} else {
 			writeError(w, 429, "Too many requests. This IP is being rate limited.")
@@ -565,9 +632,49 @@ func main() {
 
 	})
 
-	mux.HandleFunc("/createUser/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "https://3272010.xyz") // reminder to change
-		w.Header().Set("Access-Control-Allow-Methods", "GET")
+	mux.HandleFunc("/quota/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if reqRl.check(getIP(r)) {
+			// i will do later im too lazy rn
+		}
+	})
+
+	mux.HandleFunc("/ip/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		writeJSON(w, 200, getIP(r))
+	})
+
+	mux.HandleFunc("/createUser/", func(w http.ResponseWriter, r *http.Request) { // thinking about changing it from api subdomain to regular one (mux to site)
+		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
@@ -588,7 +695,11 @@ func main() {
 				return
 			}
 
-			req.Token = r.PathValue("token")
+			req.Email, _ = url.QueryUnescape(req.Email)
+			req.Username, _ = url.QueryUnescape(req.Username)
+			req.Password, _ = url.QueryUnescape(req.Password)
+			req.IP = getIP(r)
+			req.Token, _ = url.QueryUnescape(req.Token)
 
 			result := db.createUser(req)
 
@@ -598,9 +709,9 @@ func main() {
 				if result.Error()[:3] == "500" {
 					writeError(w, 500, result.Error()[3:])
 				} else if result.Error()[:3] == "302" {
-					http.Redirect(w, r, ("/sign-up?redir-reason=" + result.Error()[3:]), 302)
+					http.Redirect(w, r, ("https://authenticator.3272010.xyz/sign-up?redir-reason=" + result.Error()[3:]), 302)
 				} else if result.Error() == "success" {
-					http.Redirect(w, r, "/log-in?success=1", 302)
+					writeJSON(w, 200, "success")
 				} else {
 					writeError(w, 400, result.Error())
 				}
@@ -619,12 +730,7 @@ func main() {
 			return
 		}
 
-		if _, err := os.Stat(path + ".html"); err == nil {
-			http.ServeFile(w, r, path+".html")
-			return
-		}
-
-		http.ServeFile(w, r, "./static/404.html")
+		http.ServeFile(w, r, "./static/404")
 	})
 
 	go http.ListenAndServe(":8080", mux)
@@ -632,5 +738,3 @@ func main() {
 	http.ListenAndServe(":3000", site)
 	fmt.Println("Site running on http://localhost:3000")
 }
-
-// time to compile

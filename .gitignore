@@ -2,3 +2,4 @@
 .db
 send-text-unencrypted.py
 send-text-other.py
+/static/

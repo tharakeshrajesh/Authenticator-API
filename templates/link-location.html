@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,sans-serif;">
+  <div style="max-width:520px;margin:2rem auto;">
+    <div style="background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e5e5;">
+
+      <div style="background:#0C447C;padding:2rem;text-align:center;">
+        <p style="color:#fff;font-size:18px;font-weight:500;margin:0;">Verify your email</p>
+      </div>
+
+      <div style="padding:2rem;">
+        <p style="font-size:15px;color:#111;margin:0 0 6px;">Hi there,</p>
+        <p style="font-size:14px;color:#555;line-height:1.6;margin:0 0 1.5rem;">Click the button below to verify your email address and activate your account. This link expires in <span style="color:#111;font-weight:500;">{{.Expiration}}</span>.</p>
+
+        <div style="text-align:center;margin:1.5rem 0;">
+          <a href="{{.VerifyURL}}" style="display:inline-block;background:#185FA5;color:#fff;font-size:15px;font-weight:500;padding:12px 32px;border-radius:8px;text-decoration:none;">Verify my email</a>
+        </div>
+
+        <div style="background:#f9f9f9;border-radius:8px;padding:12px 16px;margin:1.5rem 0;">
+          <p style="font-size:12px;color:#888;margin:0 0 4px;">Or copy this link into your browser:</p>
+          <p style="font-size:12px;color:#111;margin:0;word-break:break-all;">{{.VerifyURL}}</p>
+        </div>
+
+        <div style="border-left:2px solid #e5e5e5;padding-left:12px;">
+          <p style="font-size:13px;color:#888;margin:0;line-height:1.6;">If you didn't create an account, you can safely ignore this email. This link will expire on its own.</p>
+        </div>
+
+        <br>
+        <p style="font-size:13px;color:#888;margin:0;">This request came from <span style="color:#111;">{{.Location}}</span>.</p>
+      </div>
+
+      <div style="padding:1rem 2rem;border-top:1px solid #e5e5e5;text-align:center;">
+        <p style="font-size:12px;color:#aaa;margin:0;">© 2026 <a href="https://authenticator.3272010.xyz">3272010.xyz</a></p>
+      </div>
+
+    </div>
+  </div>
+</body>
+</html>
+<!-- credits to claude -->
