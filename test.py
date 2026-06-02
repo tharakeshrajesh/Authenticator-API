@@ -7,9 +7,9 @@ api_key = "12345678901234567890123456789012"
 
 conn = sqlite3.connect(".db")
 conn.execute("""
-    INSERT INTO users (api_key, email, username, password)
-    VALUES (?, ?, ?, ?)
-""", (api_key, "test@test.com", "testuser", hashlib.sha256("Test123!".encode()).hexdigest()))
+    INSERT INTO users (api_key, email, username, password, reqsperday)
+    VALUES (?, ?, ?, ?, ?)
+""", (api_key, "test@test.com", "testuser", hashlib.sha256("Test123!".encode()).hexdigest(), 15))
 conn.commit()
 conn.close()
 

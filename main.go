@@ -128,26 +128,37 @@ func (dl *DailyLimit) dailyLimitAdd(key string) {
 	dl.clients[key] = append(valid, now)
 }
 
-func (rl *RateLimiter) quota(key string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+func (dl *DailyLimit) quota(apikey string) (username, email string, reqs_sent, reqs_remaining, daily_quota int, reset_time time.Time, time_remaining float64, times_sent []time.Time) {
+	dl.mu.Lock()
+	defer dl.mu.Unlock()
 
 	now := time.Now()
-	valid := rl.clients[key][:0]
+	valid := dl.clients[apikey][:0]
 
-	for _, t := range rl.clients[key] {
-		if t.After(now.Add(-rl.window)) {
+	for _, t := range dl.clients[apikey] {
+		if t.After(now.Add(-(time.Duration(24) * time.Hour))) {
 			valid = append(valid, t)
 		}
 	}
 
-	if len(valid) >= rl.limit {
-		rl.clients[key] = valid
-		return false
+	m_reset_time := now.Add(time.Duration(24) * time.Hour)
+	if len(valid) != 0 {
+		m_reset_time = valid[len(valid)-1].Add(time.Duration(24) * time.Hour)
 	}
+	m_time_remaining := time.Until(m_reset_time).Hours()
 
-	rl.clients[key] = append(valid, now)
-	return true
+	var limit int = 15
+	var m_username, m_email string
+
+	thiserr := dl.Conn.QueryRow(`
+		SELECT reqsperday, username, email FROM users WHERE api_key = ?
+	`, apikey).Scan(&limit, &m_username, &m_email)
+
+	dl.clients[apikey] = valid
+	if thiserr != nil {
+		return "error", "error", len(valid), (limit - len(valid)), limit, m_reset_time, m_time_remaining, valid
+	}
+	return m_username, m_email, len(valid), (limit - len(valid)), limit, m_reset_time, m_time_remaining, valid
 }
 
 func (rl *RateLimiter) cleanup() {
@@ -332,7 +343,7 @@ func (db *DB) createUser(req newUserReq) error {
 
 			_, err = db.Conn.Exec(`
 				INSERT INTO users (api_key, email, username, password, reqsperday)
-				VALUES (?, ?, ?, , ??)
+				VALUES (?, ?, ?, ?, ?)
 			`, apiKey, req.Email, req.Username, req.Password, 15)
 
 			if err != nil {
@@ -356,6 +367,12 @@ func (db *DB) createUser(req newUserReq) error {
 
 	if _, err := mail.ParseAddress(req.Email); err != nil {
 		return fmt.Errorf("An invalid email address was given.")
+	}
+
+	nonalphanumeric, _ := regexp.MatchString("[^a-zA-Z0-9]", req.Username)
+
+	if nonalphanumeric {
+		return fmt.Errorf("Only alphanumeric characters in the username are allowed!")
 	}
 
 	var usernameExists bool
@@ -624,7 +641,7 @@ func main() {
 					writeError(w, 429, "Too many requests. You are being rate limited.")
 				}
 			} else {
-				writeError(w, 401, "API key not provided. Unauthorized. https://authenticator.3272010.xyz/free-api-key")
+				writeError(w, 401, "Invalid API key provided. Unauthorized. https://authenticator.3272010.xyz/free-api-key")
 			}
 		} else {
 			writeError(w, 429, "Too many requests. This IP is being rate limited.")
@@ -673,7 +690,24 @@ func main() {
 		}
 
 		if reqRl.check(getIP(r)) {
-			// i will do later im too lazy rn
+			if db.authenticateClient(r.Header.Get("Authorization")) {
+				username, email, reqs_sent, reqs_remaining, daily_quota, reset_time, time_remaining, times_sent := dailyLimit.quota(r.Header.Get("Authorization"))
+
+				writeJSON(w, 200, map[string]any{
+					"username":                 username,
+					"email":                    email,
+					"requests_sent_today":      reqs_sent,
+					"requests_remaining_today": reqs_remaining,
+					"reset_time":               reset_time,
+					"resets_in_hours":          time_remaining,
+					"daily_quota":              daily_quota,
+					"times_requests_sent":      times_sent,
+				})
+			} else {
+				writeError(w, 401, "Invalid API key provided. Unauthorized. https://authenticator.3272010.xyz/free-api-key")
+			}
+		} else {
+			writeError(w, 429, "Too many requests. This IP is being rate limited.")
 		}
 	})
 
@@ -722,6 +756,98 @@ func main() {
 				} else {
 					writeError(w, 400, result.Error())
 				}
+			}
+		} else {
+			writeError(w, 429, "Too many requests. You are being rate limited.")
+		}
+
+	})
+
+	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) { // reminder to add rsa encryption
+		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "https://authenticator.3272010.xyz", 302)
+			return
+		}
+
+		if reqRl.check(getIP(r)) {
+			var data map[string]any
+			json.NewDecoder(r.Body).Decode(&data)
+
+			email, _ := data["email"].(string)
+			username, _ := data["username"].(string)
+			password, _ := data["password"].(string)
+			remember, _ := data["remember"].(bool)
+			hash := sha256.Sum256([]byte(password))
+			password = hex.EncodeToString(hash[:])
+
+			var dbpassword string
+			var err error
+
+			if username != "" {
+				err = db.Conn.QueryRow(`
+					SELECT password FROM users WHERE username = ?
+				`, username).Scan(&dbpassword)
+
+				if err != nil {
+					writeError(w, 400, "Account with this username does not exist! Please sign up or try again.")
+					return
+				}
+			} else if email != "" {
+				err = db.Conn.QueryRow(`
+					SELECT password FROM users WHERE email = ?
+				`, email).Scan(&dbpassword)
+
+				if err != nil {
+					writeError(w, 400, "Account with this email does not exist! Please sign up or try again")
+					return
+				}
+			} else {
+				writeError(w, 400, "Please provide an email/username.")
+				return
+			}
+
+			if dbpassword == password {
+				b := make([]byte, 16)
+				rand.Read(b)
+				session_token := hex.EncodeToString(b)
+
+				expires := time.Now().Add(24 * time.Hour)
+				if remember == true {
+					expires = time.Now().Add(720 * time.Hour)
+				}
+
+				_, err = db.Conn.Exec(`
+					INSERT INTO tokens (token, ip, device, username, email, expires_at)
+					VALUES (?, ?, ?, ?, ?, ?)
+				`, session_token, getIP(r), r.Header.Get("User-Agent"), username, email, expires)
+
+				if err != nil {
+					writeError(w, 500, "SQL error: "+err.Error())
+				}
+
+				http.SetCookie(w, &http.Cookie{
+					Name:     "session_token",
+					Value:    session_token,
+					Expires:  expires,
+					HttpOnly: true,
+					Secure:   true,
+					Path:     "/",
+				})
+
+				writeJSON(w, 200, "success")
+			} else {
+				writeError(w, 400, "Wrong password.")
+				return
 			}
 		} else {
 			writeError(w, 429, "Too many requests. You are being rate limited.")
