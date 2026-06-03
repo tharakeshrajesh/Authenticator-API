@@ -31,5 +31,6 @@ print("api key:", api_key)
 
 #     for row in rows:
 #         print(row)
+#         print("")
 
 # conn.close()

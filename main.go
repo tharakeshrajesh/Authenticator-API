@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -44,6 +47,7 @@ type newUserReq struct {
 	Password string `json:"password"`
 	Token    string `json:"token"`
 	IP       string
+	UA       string
 }
 
 type DB struct {
@@ -61,6 +65,11 @@ type DailyLimit struct {
 	mu      sync.Mutex
 	clients map[string][]time.Time
 	Conn    *sql.DB
+}
+
+type AESKeys struct {
+	key     string
+	expires int64
 }
 
 func (rl *RateLimiter) check(key string) bool {
@@ -174,7 +183,7 @@ func (rl *RateLimiter) cleanup() {
 }
 
 func (dl *DailyLimit) cleanup() {
-	for range time.Tick(time.Minute) {
+	for range time.Tick(time.Hour) {
 		dl.mu.Lock()
 		for key, timestamps := range dl.clients {
 			if len(timestamps) == 0 || timestamps[len(timestamps)-1].Before(time.Now().Add(-(time.Duration(24) * time.Hour))) {
@@ -182,6 +191,16 @@ func (dl *DailyLimit) cleanup() {
 			}
 		}
 		dl.mu.Unlock()
+	}
+}
+
+func cleanup(keys map[string]AESKeys) {
+	for range time.Tick(time.Minute) {
+		for useremail, key := range keys {
+			if time.Now().Unix() > key.expires {
+				delete(keys, useremail)
+			}
+		}
 	}
 }
 
@@ -202,6 +221,43 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	}
 
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func generateToken(length int) string {
+	b := make([]byte, (length / 2))
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func decryptPassword(aeskeything AESKeys, password string) string {
+	ciphertext, _ := base64.StdEncoding.DecodeString(password)
+	key, _ := hex.DecodeString(aeskeything.key)
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return ""
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return ""
+	}
+
+	iv := ciphertext[:12]
+	ciphertext = ciphertext[12:]
+
+	println("key hex:", hex.EncodeToString(key))
+	println("iv:", hex.EncodeToString(iv))
+	println(hex.EncodeToString(ciphertext))
+
+	plaintext, err := gcm.Open(nil, iv, ciphertext, nil)
+	if err != nil {
+		println(err.Error())
+		return ""
+	}
+
+	hash := sha256.Sum256(plaintext)
+	return hex.EncodeToString(hash[:])
 }
 
 func sendSMS(req TextRequest) error {
@@ -337,9 +393,7 @@ func (db *DB) createUser(req newUserReq) error {
 				return fmt.Errorf("500%s", err.Error())
 			}
 
-			b := make([]byte, 16)
-			rand.Read(b)
-			apiKey := hex.EncodeToString(b)
+			apiKey := generateToken(32)
 
 			_, err = db.Conn.Exec(`
 				INSERT INTO users (api_key, email, username, password, reqsperday)
@@ -372,7 +426,7 @@ func (db *DB) createUser(req newUserReq) error {
 	nonalphanumeric, _ := regexp.MatchString("[^a-zA-Z0-9]", req.Username)
 
 	if nonalphanumeric {
-		return fmt.Errorf("Only alphanumeric characters in the username are allowed!")
+		return fmt.Errorf("Only alphanumeric characters are allowed in the username!")
 	}
 
 	var usernameExists bool
@@ -398,13 +452,12 @@ func (db *DB) createUser(req newUserReq) error {
 		return fmt.Errorf("Username already exists!")
 	}
 
-	b := make([]byte, 16)
-	rand.Read(b)
+	token := generateToken(32)
 
 	_, err = db.Conn.Exec(`
 		INSERT INTO tokens (token, ip, username, email, expires_at)
 		VALUES (?, ?, ?, ?, ?)
-	`, hex.EncodeToString(b), req.IP, req.Username, req.Email, (time.Now().Unix() + 600))
+	`, token, req.IP, req.Username, req.Email, (time.Now().Unix() + 600))
 
 	if err != nil {
 		if err.Error() == "UNIQUE constraint failed: tokens.email" || err.Error() == "UNIQUE constraint failed: tokens.username" {
@@ -420,7 +473,7 @@ func (db *DB) createUser(req newUserReq) error {
 	eReq.ContentType = "html"
 	eReq.Template = "link"
 	eReq.Expiration = "5 minutes"
-	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + hex.EncodeToString(b) // reminder to change link
+	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + token // reminder to change link
 
 	err = sendEmail(eReq)
 
@@ -509,9 +562,7 @@ func (db *DB) resetApiKey(username, password string) (string, error) {
 		return "", fmt.Errorf("Incorrect password") // reminder to rate limit this so no brute forcing
 	}
 
-	b := make([]byte, 16)
-	rand.Read(b)
-	newApiKey := hex.EncodeToString(b)
+	newApiKey := generateToken(32)
 
 	_, err = db.Conn.Exec(`
 		UPDATE users SET api_key = ? WHERE username = ?
@@ -524,7 +575,7 @@ func (db *DB) resetApiKey(username, password string) (string, error) {
 	return newApiKey, nil
 }
 
-func initRl(db *DB) (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *DailyLimit) {
+func initStuff(db *DB) (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *DailyLimit, aesKeys map[string]AESKeys) {
 	SRl := RateLimiter{
 		clients: make(map[string][]time.Time),
 		limit:   10,
@@ -545,7 +596,10 @@ func initRl(db *DB) (signupRl *RateLimiter, reqRl *RateLimiter, dailyLimit *Dail
 	}
 	go dl.cleanup()
 
-	return &SRl, &RRl, &dl
+	keys := make(map[string]AESKeys)
+	go cleanup(keys)
+
+	return &SRl, &RRl, &dl, keys
 }
 
 func newSqlDb() (*DB, error) {
@@ -567,7 +621,7 @@ func main() {
 	db.initDB()
 	go db.cleanupTokens()
 
-	signupRl, reqRl, dailyLimit := initRl(db)
+	signupRl, reqRl, dailyLimit, aesKeys := initStuff(db)
 
 	mux := http.NewServeMux()
 	site := http.NewServeMux()
@@ -728,7 +782,6 @@ func main() {
 		}
 
 		if signupRl.check(getIP(r)) {
-
 			var req newUserReq
 
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -739,8 +792,8 @@ func main() {
 			req.Email, _ = url.QueryUnescape(req.Email)
 			req.Username, _ = url.QueryUnescape(req.Username)
 			req.Password, _ = url.QueryUnescape(req.Password)
-			req.IP = getIP(r)
 			req.Token, _ = url.QueryUnescape(req.Token)
+			req.IP = getIP(r)
 
 			result := db.createUser(req)
 
@@ -752,7 +805,29 @@ func main() {
 				} else if result.Error()[:3] == "302" {
 					http.Redirect(w, r, ("https://authenticator.3272010.xyz/sign-up?redir-reason=" + result.Error()[3:]), 302)
 				} else if result.Error() == "success" {
-					writeJSON(w, 200, "success")
+
+					session_token := generateToken(16)
+
+					_, err = db.Conn.Exec(`
+						INSERT INTO tokens (token, ip, device, username, email, expires_at)
+						VALUES (?, ?, ?, ?, ?, ?)
+					`, session_token, req.IP, r.Header.Get("User-Agent"), req.Username, req.Email, time.Now().Add(24*time.Hour))
+
+					if err != nil {
+						writeJSON(w, 200, "/login?success=1")
+						return
+					}
+
+					http.SetCookie(w, &http.Cookie{
+						Name:     "session_token",
+						Value:    session_token,
+						Expires:  time.Now().Add(24 * time.Hour),
+						HttpOnly: true,
+						Secure:   true,
+						Path:     "/",
+					})
+
+					writeJSON(w, 200, "/dashboard/")
 				} else {
 					writeError(w, 400, result.Error())
 				}
@@ -763,7 +838,45 @@ func main() {
 
 	})
 
-	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) { // reminder to add rsa encryption
+	site.HandleFunc("/getKey/", func(w http.ResponseWriter, r *http.Request) { // screw this im just going to do aes. update: omg this took me so many hours, imagine how long rsa wouldve taken.
+		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "https://authenticator.3272010.xyz", 302)
+			return
+		}
+
+		if reqRl.check(getIP(r)) {
+			var data map[string]any
+			json.NewDecoder(r.Body).Decode(&data)
+
+			email, _ := data["email"].(string)
+
+			if email == "" {
+				writeError(w, 400, "An email was not provided.")
+				return
+			}
+
+			aeskey := generateToken(32)
+
+			aesKeys[email] = AESKeys{aeskey, (time.Now().Unix() + 600)}
+
+			writeJSON(w, 200, aeskey)
+		} else {
+			writeError(w, 429, "Too many requests. You are being rate limited.")
+		}
+
+	})
+
+	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) { // screw this im just going to do aes
 		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST")
@@ -787,8 +900,6 @@ func main() {
 			username, _ := data["username"].(string)
 			password, _ := data["password"].(string)
 			remember, _ := data["remember"].(bool)
-			hash := sha256.Sum256([]byte(password))
-			password = hex.EncodeToString(hash[:])
 
 			var dbpassword string
 			var err error
@@ -816,10 +927,10 @@ func main() {
 				return
 			}
 
+			password = decryptPassword(aesKeys[email], password)
+
 			if dbpassword == password {
-				b := make([]byte, 16)
-				rand.Read(b)
-				session_token := hex.EncodeToString(b)
+				session_token := generateToken(16)
 
 				expires := time.Now().Add(24 * time.Hour)
 				if remember == true {
@@ -852,6 +963,10 @@ func main() {
 		} else {
 			writeError(w, 429, "Too many requests. You are being rate limited.")
 		}
+
+	})
+
+	site.HandleFunc("/dashboard/", func(w http.ResponseWriter, r *http.Request) {
 
 	})
 
