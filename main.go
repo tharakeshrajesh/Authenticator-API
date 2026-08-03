@@ -229,9 +229,8 @@ func generateToken(length int) string {
 	return hex.EncodeToString(b)
 }
 
-func decryptPassword(aeskeything AESKeys, password string) string {
+func decryptPassword(key []byte, password string) string {
 	ciphertext, _ := base64.StdEncoding.DecodeString(password)
-	key, _ := hex.DecodeString(aeskeything.key)
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -352,15 +351,15 @@ func (db *DB) createUser(req newUserReq) error {
 			return fmt.Errorf("302invalid%20token") // spaces should automatically be encoded to %20 hopefully. edit: it does but just to be safe im harcoding it in.
 		}
 
-		err = db.Conn.QueryRow(`
-			SELECT EXISTS(
-				SELECT 1 FROM tokens WHERE ip = ?
-			)
-		`, req.IP).Scan(&exists)
+		// err = db.Conn.QueryRow(`
+		// 	SELECT EXISTS(
+		// 		SELECT 1 FROM tokens WHERE ip = ?
+		// 	)
+		// `, req.IP).Scan(&exists)
 
-		if err != nil || !exists { // thinking about removing this
-			return fmt.Errorf("302ip%20mismatch")
-		}
+		// if err != nil || !exists { // thinking about removing this
+		// 	return fmt.Errorf("302ip%20mismatch")
+		// }
 
 		if req.Password != "" {
 
@@ -408,6 +407,10 @@ func (db *DB) createUser(req newUserReq) error {
 				DELETE FROM tokens WHERE token = ?
 			`, req.Token)
 
+			_, err = db.Conn.Exec(`
+				DELETE FROM tokens WHERE email = ?
+			`, req.Email)
+
 			if err != nil {
 				return fmt.Errorf("500%s", err.Error())
 			}
@@ -431,6 +434,7 @@ func (db *DB) createUser(req newUserReq) error {
 
 	var usernameExists bool
 	var emailExists bool
+	var lastReq int64
 
 	err := db.Conn.QueryRow(`
         SELECT EXISTS(
@@ -440,6 +444,14 @@ func (db *DB) createUser(req newUserReq) error {
 
 	if err != nil || emailExists {
 		return fmt.Errorf("An account with this email already exists!")
+	}
+
+	err = db.Conn.QueryRow(`
+        SELECT lastReq FROM tokens WHERE ip = ? ORDER BY lastReq DESC LIMIT 1
+    `, req.IP).Scan(&lastReq)
+
+	if lastReq > time.Now().Unix() {
+		return fmt.Errorf("Please wait 1 minute before resending verification!")
 	}
 
 	err = db.Conn.QueryRow(`
@@ -455,9 +467,9 @@ func (db *DB) createUser(req newUserReq) error {
 	token := generateToken(32)
 
 	_, err = db.Conn.Exec(`
-		INSERT INTO tokens (token, ip, username, email, expires_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, token, req.IP, req.Username, req.Email, (time.Now().Unix() + 600))
+		INSERT INTO tokens (token, ip, username, email, lastReq, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, token, req.IP, req.Username, req.Email, (time.Now().Unix() + 60), (time.Now().Unix() + 600))
 
 	if err != nil {
 		if err.Error() == "UNIQUE constraint failed: tokens.email" || err.Error() == "UNIQUE constraint failed: tokens.username" {
@@ -473,13 +485,13 @@ func (db *DB) createUser(req newUserReq) error {
 	eReq.ContentType = "html"
 	eReq.Template = "link"
 	eReq.Expiration = "5 minutes"
-	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + token // reminder to change link
+	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + token
 
-	err = sendEmail(eReq)
+	// err = sendEmail(eReq)
 
-	if err != nil {
-		return err
-	}
+	// if err != nil {
+	// 	return err
+	// }
 
 	return nil
 }
@@ -517,6 +529,7 @@ func (db *DB) initDB() error {
 			device TEXT,
 			username TEXT NOT NULL,
 			email TEXT NOT NULL,
+			lastReq INTEGER,
 			expires_at INTEGER NOT NULL
 		);
     `)
@@ -838,7 +851,7 @@ func main() {
 
 	})
 
-	site.HandleFunc("/getKey/", func(w http.ResponseWriter, r *http.Request) { // screw this im just going to do aes. update: omg this took me so many hours, imagine how long rsa wouldve taken.
+	site.HandleFunc("/getKey/", func(w http.ResponseWriter, r *http.Request) {
 		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST")
@@ -876,7 +889,7 @@ func main() {
 
 	})
 
-	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) { // screw this im just going to do aes
+	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) { // wait omg this newer encryption method is so much safer.
 		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST")
@@ -927,7 +940,7 @@ func main() {
 				return
 			}
 
-			password = decryptPassword(aesKeys[email], password)
+			password = decryptPassword([]byte(dbpassword[:32]), password)
 
 			if dbpassword == password {
 				session_token := generateToken(16)
