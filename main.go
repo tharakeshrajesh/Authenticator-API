@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/mail"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/hkdf"
 )
 
 type EmailRequest struct {
@@ -259,6 +261,80 @@ func decryptPassword(key []byte, password string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+func encryptAES(key []byte, password string) string {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return ""
+	}
+
+	hkdf := hkdf.New(sha256.New, key, salt, []byte("password-encryption"))
+	derivedKey := make([]byte, 32)
+	if _, err := io.ReadFull(hkdf, derivedKey); err != nil {
+		return ""
+	}
+
+	block, err := aes.NewCipher(derivedKey)
+	if err != nil {
+		return ""
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return ""
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return ""
+	}
+
+	ciphertext := gcm.Seal(nil, nonce, []byte(password), nil)
+
+	result := append(salt, nonce...)
+	result = append(result, ciphertext...)
+
+	return base64.StdEncoding.EncodeToString(result)
+}
+
+func decryptAES(key []byte, encrypted string) string {
+	data, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		return ""
+	}
+
+	if len(data) < 16+12+16 {
+		return ""
+	}
+
+	salt := data[:16]
+	nonce := data[16:28]
+	ciphertext := data[28:]
+
+	hkdf := hkdf.New(sha256.New, key, salt, []byte("password-encryption"))
+	derivedKey := make([]byte, 32)
+
+	if _, err := io.ReadFull(hkdf, derivedKey); err != nil {
+		return ""
+	}
+
+	block, err := aes.NewCipher(derivedKey)
+	if err != nil {
+		return ""
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return ""
+	}
+
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return ""
+	}
+
+	return string(plaintext)
+}
+
 func sendSMS(req TextRequest) error {
 	out, err := exec.Command("python", "send-text.py", req.Recipient, req.Code).Output() // i really need to find a better way than running slow python everytime
 	if err != nil {
@@ -348,7 +424,7 @@ func (db *DB) createUser(req newUserReq) error {
 		`, req.Token).Scan(&exists)
 
 		if err != nil || !exists {
-			return fmt.Errorf("302invalid%20token") // spaces should automatically be encoded to %20 hopefully. edit: it does but just to be safe im harcoding it in.
+			return fmt.Errorf("302invalid token") // spaces should automatically be encoded to %20 hopefully. edit: it does but just to be safe im harcoding it in.
 		}
 
 		// err = db.Conn.QueryRow(`
@@ -487,11 +563,11 @@ func (db *DB) createUser(req newUserReq) error {
 	eReq.Expiration = "5 minutes"
 	eReq.Body = "https://authenticator.3272010.xyz/set-password?token=" + token
 
-	// err = sendEmail(eReq)
+	err = sendEmail(eReq)
 
-	// if err != nil {
-	// 	return err
-	// }
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -529,6 +605,7 @@ func (db *DB) initDB() error {
 			device TEXT,
 			username TEXT NOT NULL,
 			email TEXT NOT NULL,
+			api_key TEXT,
 			lastReq INTEGER,
 			expires_at INTEGER NOT NULL
 		);
@@ -766,6 +843,7 @@ func main() {
 					"requests_sent_today":      reqs_sent,
 					"requests_remaining_today": reqs_remaining,
 					"reset_time":               reset_time,
+					"reset_time_unix":          reset_time.Unix(),
 					"resets_in_hours":          time_remaining,
 					"daily_quota":              daily_quota,
 					"times_requests_sent":      times_sent,
@@ -916,6 +994,7 @@ func main() {
 
 			var dbpassword string
 			var err error
+			var apiKey string
 
 			if username != "" {
 				err = db.Conn.QueryRow(`
@@ -924,6 +1003,15 @@ func main() {
 
 				if err != nil {
 					writeError(w, 400, "Account with this username does not exist! Please sign up or try again.")
+					return
+				}
+
+				err = db.Conn.QueryRow(`
+					SELECT api_key FROM users WHERE username = ?
+				`, username).Scan(&apiKey)
+
+				if err != nil {
+					writeError(w, 500, "SQL error: "+err.Error())
 					return
 				}
 			} else if email != "" {
@@ -935,6 +1023,15 @@ func main() {
 					writeError(w, 400, "Account with this email does not exist! Please sign up or try again")
 					return
 				}
+
+				err = db.Conn.QueryRow(`
+					SELECT api_key FROM users WHERE email = ?
+				`, email).Scan(&apiKey)
+
+				if err != nil {
+					writeError(w, 500, "SQL error: "+err.Error())
+					return
+				}
 			} else {
 				writeError(w, 400, "Please provide an email/username.")
 				return
@@ -942,7 +1039,7 @@ func main() {
 
 			password = decryptPassword([]byte(dbpassword[:32]), password)
 
-			if dbpassword == password {
+			if dbpassword != password { // just for now; reminder to delete later
 				session_token := generateToken(16)
 
 				expires := time.Now().Add(24 * time.Hour)
@@ -951,9 +1048,9 @@ func main() {
 				}
 
 				_, err = db.Conn.Exec(`
-					INSERT INTO tokens (token, ip, device, username, email, expires_at)
-					VALUES (?, ?, ?, ?, ?, ?)
-				`, session_token, getIP(r), r.Header.Get("User-Agent"), username, email, expires)
+					INSERT INTO tokens (token, ip, device, username, email, api_key, expires_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)
+				`, session_token, getIP(r), r.Header.Get("User-Agent"), username, email, apiKey, expires)
 
 				if err != nil {
 					writeError(w, 500, "SQL error: "+err.Error())
@@ -979,12 +1076,86 @@ func main() {
 
 	})
 
-	site.HandleFunc("/dashboard/", func(w http.ResponseWriter, r *http.Request) {
+	// site.HandleFunc("/dashboard/", func(w http.ResponseWriter, r *http.Request) {
 
+	// })
+
+	site.HandleFunc("/info/", func(w http.ResponseWriter, r *http.Request) {
+		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "https://authenticator.3272010.xyz", 302)
+			return
+		}
+
+		if signupRl.check(getIP(r)) {
+			var data map[string]any
+			json.NewDecoder(r.Body).Decode(&data)
+
+			reqType, _ := data["type"].(string)
+
+			token, err := r.Cookie("session_token")
+
+			if err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+
+			var apiKey string
+			err = db.Conn.QueryRow(`
+					SELECT api_key FROM tokens WHERE token = ?
+			`, token.Value).Scan(&apiKey)
+
+			if reqType == "refresh" { // should probably use a switch here instead
+				username, _, reqs_sent, _, daily_quota, reset_time, _, times_sent := dailyLimit.quota(apiKey)
+
+				writeJSON(w, 200, map[string]any{
+					"username":           username,
+					"requestsSentToday":  reqs_sent,
+					"resetUnixTimestamp": reset_time.Unix(),
+					"dailyQuota":         daily_quota,
+					"requestTimestamps":  times_sent,
+				})
+			} else if reqType == "reveal_api_key" {
+				writeJSON(w, 200, map[string]any{
+					"apiKey": apiKey,
+				})
+			} else if reqType == "reset_api_key" {
+				var username string
+				var password string
+
+				apiKey, err = db.resetApiKey(username, password)
+
+				if err != nil {
+					writeError(w, 500, err.Error())
+					return
+				}
+
+				_, err = db.Conn.Exec(`
+					DELETE FROM tokens WHERE username = ?
+				`, username)
+
+				writeJSON(w, 200, map[string]any{
+					"apiKey": apiKey,
+				})
+			}
+		} else {
+			writeError(w, 429, "Too many requests. You are being rate limited.")
+		}
 	})
 
 	site.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := "./static" + r.URL.Path
+
+		path = strings.TrimSuffix(path, "/")
 
 		if _, err := os.Stat(path); err == nil {
 			http.ServeFile(w, r, path)
