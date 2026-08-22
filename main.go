@@ -413,7 +413,6 @@ func getIP(r *http.Request) string {
 }
 
 func (db *DB) createUser(req newUserReq) error {
-
 	if req.Token != "" {
 		var exists bool
 
@@ -508,8 +507,7 @@ func (db *DB) createUser(req newUserReq) error {
 		return fmt.Errorf("Only alphanumeric characters are allowed in the username!")
 	}
 
-	var usernameExists bool
-	var emailExists bool
+	var usernameExists, emailExists bool
 	var lastReq int64
 
 	err := db.Conn.QueryRow(`
@@ -649,7 +647,7 @@ func (db *DB) resetApiKey(username, password string) (string, error) {
 	if err == sql.ErrNoRows {
 		return "", fmt.Errorf("User not found")
 	} else if dbpassword != password {
-		return "", fmt.Errorf("Incorrect password") // reminder to rate limit this so no brute forcing
+		return "", fmt.Errorf("Incorrect password")
 	}
 
 	newApiKey := generateToken(32)
@@ -717,7 +715,6 @@ func main() {
 	site := http.NewServeMux()
 
 	mux.HandleFunc("/sendEmail/", func(w http.ResponseWriter, r *http.Request) {
-
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
@@ -896,7 +893,6 @@ func main() {
 				} else if result.Error()[:3] == "302" {
 					http.Redirect(w, r, ("https://authenticator.3272010.xyz/sign-up?redir-reason=" + result.Error()[3:]), 302)
 				} else if result.Error() == "success" {
-
 					session_token := generateToken(16)
 
 					_, err = db.Conn.Exec(`
@@ -967,7 +963,7 @@ func main() {
 
 	})
 
-	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) { // wait omg this newer encryption method is so much safer.
+	site.HandleFunc("/authenticate/", func(w http.ResponseWriter, r *http.Request) {
 		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST")
@@ -992,9 +988,8 @@ func main() {
 			password, _ := data["password"].(string)
 			remember, _ := data["remember"].(bool)
 
-			var dbpassword string
+			var dbpassword, apiKey string
 			var err error
-			var apiKey string
 
 			if username != "" {
 				err = db.Conn.QueryRow(`
@@ -1076,9 +1071,44 @@ func main() {
 
 	})
 
-	// site.HandleFunc("/dashboard/", func(w http.ResponseWriter, r *http.Request) {
+	site.HandleFunc("/changeEmail/", func(w http.ResponseWriter, r *http.Request) { // reminder to make changeEmailSuccess.html and changeEmailError.html
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	// })
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		token := r.URL.Query().Get("token")
+		var apiKey, email string
+
+		err = db.Conn.QueryRow(`
+			SELECT username, email FROM tokens WHERE token = ?
+		`, token).Scan(&apiKey, &email)
+
+		if err != nil {
+			http.ServeFile(w, r, ".static/changeEmailError.html")
+			return
+		}
+
+		_, err = db.Conn.Exec(`
+			UPDATE users SET email = ? WHERE api_key = ?
+		`, email, apiKey)
+
+		if err != nil {
+			http.ServeFile(w, r, ".static/changeEmailError.html")
+			return
+		}
+
+		http.ServeFile(w, r, ".static/changeEmailSuccess.html")
+	})
 
 	site.HandleFunc("/info/", func(w http.ResponseWriter, r *http.Request) {
 		// w.Header().Set("Access-Control-Allow-Origin", "https://authenticator.3272010.xyz")
@@ -1109,12 +1139,23 @@ func main() {
 				return
 			}
 
+			var ip string
+			err = db.Conn.QueryRow(`
+				SELECT ip FROM tokens WHERE token = ?
+			`, token).Scan(&ip)
+
+			if err != nil || ip != getIP(r) {
+				writeError(w, 500, "IP addresses do not match.")
+				return
+			}
+
 			var apiKey string
 			err = db.Conn.QueryRow(`
 					SELECT api_key FROM tokens WHERE token = ?
 			`, token.Value).Scan(&apiKey)
 
-			if reqType == "refresh" { // should probably use a switch here instead
+			switch reqType {
+			case "refresh":
 				username, _, reqs_sent, _, daily_quota, reset_time, _, times_sent := dailyLimit.quota(apiKey)
 
 				writeJSON(w, 200, map[string]any{
@@ -1124,13 +1165,13 @@ func main() {
 					"dailyQuota":         daily_quota,
 					"requestTimestamps":  times_sent,
 				})
-			} else if reqType == "reveal_api_key" {
+			case "reveal_api_key":
 				writeJSON(w, 200, map[string]any{
 					"apiKey": apiKey,
 				})
-			} else if reqType == "reset_api_key" {
-				var username string
-				var password string
+			case "reset_api_key":
+				username, _ := data["username"].(string)
+				password, _ := data["password"].(string)
 
 				apiKey, err = db.resetApiKey(username, password)
 
@@ -1146,6 +1187,90 @@ func main() {
 				writeJSON(w, 200, map[string]any{
 					"apiKey": apiKey,
 				})
+			case "change_email":
+				email, _ := data["email"].(string)
+				password, _ := data["password"].(string)
+
+				var dbpassword string
+
+				err := db.Conn.QueryRow(`
+					SELECT password FROM users WHERE api_key = ?
+				`, apiKey).Scan(&dbpassword)
+
+				if err == sql.ErrNoRows {
+					writeError(w, 500, "User not found.")
+					return
+				} else if dbpassword != password {
+					writeError(w, 400, "Incorrect password")
+					return
+				}
+
+				emailToken := generateToken(16)
+
+				_, err = db.Conn.Exec(`
+					INSERT INTO tokens (token, ip, username, email, expires_at)
+					VALUES (?, ?, ?, ?, ?)
+				`, emailToken, getIP(r), apiKey, email, time.Now().Add(5*time.Minute))
+
+				if err != nil {
+					writeError(w, 500, "SQL error: "+err.Error())
+					return
+				}
+
+				var req EmailRequest
+				req.Subject = "Verify your email change"
+				req.Expiration = "5 minutes"
+				req.Template = "link"
+				req.Body = "https://authenticator.3272010.xyz/changeEmail?token=" + emailToken
+
+				result := sendEmail(req)
+
+				if result != nil {
+					writeError(w, 500, result.Error())
+					return
+				}
+
+				writeJSON(w, 200, "Please check your inbox for a verification email.")
+			case "change_password":
+				currentPassword, _ := data["currentPassword"].(string)
+				newPassword, _ := data["newPassword"].(string)
+				var dbpassword string
+
+				err = db.Conn.QueryRow(`
+					SELECT password FROM users WHERE api_key = ?
+				`, apiKey).Scan(&dbpassword)
+
+				if err != nil {
+					writeError(w, 500, err.Error())
+					return
+				}
+
+				if dbpassword == currentPassword {
+					_, err = db.Conn.Exec(`
+						UPDATE users SET password = ? WHERE api_key = ?
+					`, apiKey, newPassword)
+
+					if err != nil {
+						writeError(w, 500, err.Error())
+						return
+					}
+
+					// send email notification here
+
+					_, err := db.Conn.Exec(`
+						DELETE FROM tokens WHERE api_key = ?
+					`, apiKey)
+
+					if err != nil {
+						writeError(w, 500, "There was an error logging out all other devices!")
+						return
+					}
+
+				} else {
+					writeError(w, 400, "Incorrect password.")
+					return
+				}
+
 			}
 		} else {
 			writeError(w, 429, "Too many requests. You are being rate limited.")
