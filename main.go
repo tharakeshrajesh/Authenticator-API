@@ -74,6 +74,13 @@ type AESKeys struct {
 	expires int64
 }
 
+type Device struct {
+	name       string `json:"name"`
+	location   string `json:"location"`
+	lastActive string `json:"lastActive"`
+	current    bool   `json:"current"`
+}
+
 func (rl *RateLimiter) check(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -600,10 +607,10 @@ func (db *DB) initDB() error {
         CREATE TABLE tokens (
 			token TEXT PRIMARY KEY,
 			ip TEXT,
-			device TEXT,
+			user_agent TEXT,
+			last_active TEXT,
 			username TEXT NOT NULL,
 			email TEXT NOT NULL,
-			api_key TEXT,
 			lastReq INTEGER,
 			expires_at INTEGER NOT NULL
 		);
@@ -988,7 +995,7 @@ func main() {
 			password, _ := data["password"].(string)
 			remember, _ := data["remember"].(bool)
 
-			var dbpassword, apiKey string
+			var dbpassword string
 			var err error
 
 			if username != "" {
@@ -1000,10 +1007,6 @@ func main() {
 					writeError(w, 400, "Account with this username does not exist! Please sign up or try again.")
 					return
 				}
-
-				err = db.Conn.QueryRow(`
-					SELECT api_key FROM users WHERE username = ?
-				`, username).Scan(&apiKey)
 
 				if err != nil {
 					writeError(w, 500, "SQL error: "+err.Error())
@@ -1018,10 +1021,6 @@ func main() {
 					writeError(w, 400, "Account with this email does not exist! Please sign up or try again")
 					return
 				}
-
-				err = db.Conn.QueryRow(`
-					SELECT api_key FROM users WHERE email = ?
-				`, email).Scan(&apiKey)
 
 				if err != nil {
 					writeError(w, 500, "SQL error: "+err.Error())
@@ -1043,9 +1042,9 @@ func main() {
 				}
 
 				_, err = db.Conn.Exec(`
-					INSERT INTO tokens (token, ip, device, username, email, api_key, expires_at)
+					INSERT INTO tokens (token, ip, user_agent, last_active, username, email, expires_at)
 					VALUES (?, ?, ?, ?, ?, ?, ?)
-				`, session_token, getIP(r), r.Header.Get("User-Agent"), username, email, apiKey, expires)
+				`, session_token, getIP(r), r.Header.Get("User-Agent"), time.Now().Format(time.RFC3339), username, email, expires)
 
 				if err != nil {
 					writeError(w, 500, "SQL error: "+err.Error())
@@ -1151,8 +1150,22 @@ func main() {
 
 			var apiKey string
 			err = db.Conn.QueryRow(`
-					SELECT api_key FROM tokens WHERE token = ?
+					SELECT email FROM tokens WHERE token = ?
 			`, token.Value).Scan(&apiKey)
+
+			if err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+
+			err = db.Conn.QueryRow(`
+					SELECT api_key FROM users WHERE email = ?
+			`, apiKey).Scan(&apiKey)
+
+			if err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
 
 			switch reqType {
 			case "refresh":
@@ -1170,13 +1183,22 @@ func main() {
 					"apiKey": apiKey,
 				})
 			case "reset_api_key":
-				username, _ := data["username"].(string)
-				password, _ := data["password"].(string)
+				var username, password string
+				password, _ = data["password"].(string)
+
+				err = db.Conn.QueryRow(`
+						SELECT username FROM tokens WHERE token = ?
+				`, token.Value).Scan(&username)
+
+				if err != nil {
+					writeError(w, 500, "SQL Error: "+err.Error())
+					return
+				}
 
 				apiKey, err = db.resetApiKey(username, password)
 
 				if err != nil {
-					writeError(w, 500, err.Error())
+					writeError(w, 500, "SQL Error: "+err.Error())
 					return
 				}
 
@@ -1188,19 +1210,29 @@ func main() {
 					"apiKey": apiKey,
 				})
 			case "change_email":
-				email, _ := data["email"].(string)
+				newEmail, _ := data["email"].(string)
 				password, _ := data["password"].(string)
 
-				var dbpassword string
+				var dbpassword, currentEmail string
+
+				err = db.Conn.QueryRow(`
+						SELECT email FROM tokens WHERE token = ?
+				`, token.Value).Scan(&currentEmail)
+
+				if err != nil {
+					writeError(w, 500, "SQL Error: "+err.Error())
+					return
+				}
 
 				err := db.Conn.QueryRow(`
-					SELECT password FROM users WHERE api_key = ?
-				`, apiKey).Scan(&dbpassword)
+					SELECT password FROM users WHERE email = ?
+				`, currentEmail).Scan(&dbpassword)
 
 				if err == sql.ErrNoRows {
 					writeError(w, 500, "User not found.")
 					return
-				} else if dbpassword != password {
+				}
+				if dbpassword != password {
 					writeError(w, 400, "Incorrect password")
 					return
 				}
@@ -1210,7 +1242,7 @@ func main() {
 				_, err = db.Conn.Exec(`
 					INSERT INTO tokens (token, ip, username, email, expires_at)
 					VALUES (?, ?, ?, ?, ?)
-				`, emailToken, getIP(r), apiKey, email, time.Now().Add(5*time.Minute))
+				`, emailToken, getIP(r), apiKey, newEmail, time.Now().Add(5*time.Minute))
 
 				if err != nil {
 					writeError(w, 500, "SQL error: "+err.Error())
@@ -1222,6 +1254,7 @@ func main() {
 				req.Expiration = "5 minutes"
 				req.Template = "link"
 				req.Body = "https://authenticator.3272010.xyz/changeEmail?token=" + emailToken
+				req.Recipient = newEmail
 
 				result := sendEmail(req)
 
@@ -1241,7 +1274,7 @@ func main() {
 				`, apiKey).Scan(&dbpassword)
 
 				if err != nil {
-					writeError(w, 500, err.Error())
+					writeError(w, 500, "SQL Error: "+err.Error())
 					return
 				}
 
@@ -1251,11 +1284,19 @@ func main() {
 					`, apiKey, newPassword)
 
 					if err != nil {
-						writeError(w, 500, err.Error())
+						writeError(w, 500, "SQL Error: "+err.Error())
 						return
 					}
 
-					// send email notification here
+					var req EmailRequest
+					req.Subject = "Your password has been changed"
+					req.Template = "password_change" // reminder to make this template
+
+					result := sendEmail(req)
+
+					if result != nil {
+						writeError(w, 500, result.Error())
+					}
 
 					_, err := db.Conn.Exec(`
 						DELETE FROM tokens WHERE api_key = ?
@@ -1266,10 +1307,58 @@ func main() {
 						return
 					}
 
+					writeJSON(w, 200, "Password successfully changed.")
+					return
+
 				} else {
 					writeError(w, 400, "Incorrect password.")
 					return
 				}
+			case "logged_in_devices":
+				devices := make([]Device, 0)
+
+				rows, err := db.Conn.Query(`
+					SELECT user_agent, ip, last_active FROM tokens WHERE token = ?
+				`, token.Value)
+
+				if err != nil {
+					writeError(w, 500, "SQL Error: "+err.Error())
+					return
+				}
+				defer rows.Close()
+
+				currentUA := r.Header.Get("User-Agent")
+
+				for rows.Next() {
+					var (
+						userAgent  string
+						ip         string
+						lastActive string
+					)
+
+					err = rows.Scan(&userAgent, &ip, &lastActive)
+					if err != nil {
+						writeError(w, 500, "SQL Error: "+err.Error())
+						return
+					}
+
+					devices = append(devices, Device{
+						name:       userAgent,
+						location:   ip,
+						lastActive: lastActive,
+						current:    userAgent == currentUA,
+					})
+				}
+
+				err = rows.Err()
+				if err != nil {
+					writeError(w, 500, "SQL Error: "+err.Error())
+					return
+				}
+
+				writeJSON(w, 200, json.NewEncoder(w).Encode(map[string]any{
+					"devices": devices,
+				}))
 
 			}
 		} else {
@@ -1284,6 +1373,15 @@ func main() {
 
 		if _, err := os.Stat(path); err == nil {
 			http.ServeFile(w, r, path)
+
+			if path == "dashboard" {
+				token, _ := r.Cookie("session_token")
+
+				db.Conn.Exec(`
+					UPDATE tokens SET last_active = ? WHERE token = ?
+				`, time.Now().Format(time.RFC3339), token)
+			}
+
 			return
 		}
 
